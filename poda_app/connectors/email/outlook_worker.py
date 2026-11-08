@@ -9,6 +9,7 @@ from .models import MailError, address_hash, mask_address, split_sender
 
 REMEDY = "Open classic Outlook for Windows and sign in to a mail profile."
 MAIL_ITEM = 43
+FLAG_WITHOUT_DUE_DATE = 4
 DEFAULT_FOLDERS = {"INBOX": 6, "Drafts": 16, "Sent": 5, "Trash": 3}
 MAPI = "http://schemas.microsoft.com/mapi/proptag/"
 SCAN_LIMIT = 5000
@@ -203,7 +204,7 @@ def dispatch(namespace, operation, args):
             item.UnRead = not args["read"]
         if args.get("flagged") is not None:
             if args["flagged"]:
-                item.MarkAsTask(0)
+                item.MarkAsTask(FLAG_WITHOUT_DUE_DATE)
             else:
                 item.ClearTaskFlag()
         item.Save()

@@ -46,6 +46,29 @@ def test_outlook_worker_checks_message_folder_and_native_type():
         outlook_worker._find(namespace, store, folder, "entry")
 
 
+def test_outlook_flag_does_not_schedule_a_due_date(monkeypatch):
+    class Item:
+        EntryID = "message"
+        UnRead = False
+        FlagStatus = 0
+
+        def MarkAsTask(self, interval):
+            assert interval == 4
+            self.FlagStatus = 2
+
+        def Save(self):
+            pass
+
+    item = Item()
+    monkeypatch.setattr(outlook_worker, "_accounts", lambda namespace: [(None, None, "profile", "")])
+    monkeypatch.setattr(outlook_worker, "_folders", lambda store: {"INBOX": object()})
+    monkeypatch.setattr(outlook_worker, "_find", lambda *args: item)
+    result = outlook_worker.dispatch(None, "set_flags", {
+        "account": "profile", "mailbox": "INBOX", "native_id": "message", "flagged": True,
+    })
+    assert result == {"read": True, "flagged": True}
+
+
 @pytest.mark.skipif(sys.platform != "win32", reason="requires the native Windows credential store")
 def test_windows_sqlcipher_key_persists_in_credential_manager(tmp_path, monkeypatch):
     service_name = "PODA.Test." + uuid.uuid4().hex
