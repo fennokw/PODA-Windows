@@ -1,0 +1,71 @@
+name: PODA Desktop for Windows
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  windows-x64:
+    runs-on: windows-2025
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: desktop/package-lock.json
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          architecture: x64
+          cache: pip
+      - name: Install the Windows runtime and verify native startup
+        shell: pwsh
+        run: |
+          $env:PODA_DATA_DIR = Join-Path $env:RUNNER_TEMP 'poda-ci'
+          ./setup-windows.ps1
+          $runtime = Get-ChildItem (Join-Path $env:PODA_DATA_DIR 'desktop-runtime') -Directory | Select-Object -First 1
+          & (Join-Path $runtime.FullName 'Scripts/python.exe') -m pytest -q --basetemp (Join-Path $env:RUNNER_TEMP 'poda-pytest') tests/test_windows_port.py tests/test_desktop_backend.py tests/test_knowledge_graph.py tests/test_chat_tools.py
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Package the x64 app
+        shell: pwsh
+        working-directory: desktop
+        run: |
+          npm ci --ignore-scripts
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          npm run package:windows
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $bundle = '../dist/desktop/PODA-win32-x64'
+          foreach ($file in @('PODA.exe', 'resources/app.asar', 'resources/backend/Setup-PODA.cmd', 'resources/backend/setup-windows.ps1')) {
+            if (-not (Test-Path (Join-Path $bundle $file) -PathType Leaf)) { throw "Missing $file" }
+          }
+          $env:PODA_DATA_DIR = Join-Path $env:RUNNER_TEMP 'poda-ci'
+          $log = Join-Path $env:PODA_DATA_DIR 'logs/desktop-server.log'
+          $desktop = Start-Process -FilePath (Join-Path $bundle 'PODA.exe') -PassThru
+          try {
+            $ready = $false
+            $deadline = (Get-Date).AddSeconds(55)
+            while ((Get-Date) -lt $deadline -and -not $desktop.HasExited) {
+              if ((Test-Path $log) -and (Select-String -LiteralPath $log -Pattern 'Application startup complete' -Quiet)) {
+                $ready = $true
+                break
+              }
+              Start-Sleep -Milliseconds 500
+            }
+            if (-not $ready) {
+              if (Test-Path $log) { Get-Content -LiteralPath $log }
+              throw 'PODA.exe did not start its encrypted backend.'
+            }
+          }
+          finally {
+            if (-not $desktop.HasExited -and (-not $desktop.CloseMainWindow() -or -not $desktop.WaitForExit(16000))) {
+              Stop-Process -Id $desktop.Id -Force -ErrorAction SilentlyContinue
+            }
+          }
+          Compress-Archive -Path $bundle -DestinationPath ../dist/PODA-Windows-x64.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: PODA-Windows-x64
+          path: dist/PODA-Windows-x64.zip
+          if-no-files-found: error
