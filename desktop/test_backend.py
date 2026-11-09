@@ -102,7 +102,8 @@ def test_relaunch_waits_for_profile_and_keeps_grant(tmp_path):
 
         first, first_log = start("first")
         http = connect(first, first_log)
-        assert http.post("/agent/grants", json={"root_path": str(folder), "mode": "read"}).status_code == 200
+        grant = http.post("/agent/grants", json={"root_path": str(folder), "mode": "read"}, timeout=25)
+        assert grant.status_code == 200, grant.text
         second, second_log = start("second")
         time.sleep(2)
         assert second.poll() is None
