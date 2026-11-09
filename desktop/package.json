@@ -7,7 +7,7 @@
   "scripts": {
     "start": "npm run stage:backend && electron .",
     "package:windows": "node package-windows.cjs",
-    "stage:backend": "python stage_backend.py .backend"
+    "stage:backend": "py.exe -3.12 stage_backend.py .backend"
   },
   "devDependencies": {
     "@electron/packager": "20.3.0",
