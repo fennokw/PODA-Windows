@@ -42,11 +42,17 @@ async function startBackend(python) {
   backend.once('close', () => log.end());
   const lines = readline.createInterface({ input: backend.stdout });
   const port = await new Promise((resolve, reject) => {
-    const timer = setTimeout(() => reject(new Error('The local backend did not report a port.')), 30000);
+    const timer = setTimeout(() => reject(new Error('The local backend did not report a port.')), 45000);
     const done = fn => value => { clearTimeout(timer); fn(value); };
     backend.once('error', done(reject));
-    backend.once('exit', done(code => reject(new Error(`Backend exited during startup (code ${code}).`))));
+    backend.once('close', done(code => reject(new Error(`Backend exited during startup (code ${code}).`))));
     lines.on('line', line => {
+      if (line.startsWith('PODA_DESKTOP_ERROR ')) {
+        log.write(line + '\n');
+        try { done(reject)(new Error(JSON.parse(line.slice('PODA_DESKTOP_ERROR '.length)).message)); }
+        catch (error) { done(reject)(error); }
+        return;
+      }
       if (!line.startsWith('PODA_DESKTOP ')) { log.write(line + '\n'); return; }
       try {
         const candidate = JSON.parse(line.slice('PODA_DESKTOP '.length)).port;
