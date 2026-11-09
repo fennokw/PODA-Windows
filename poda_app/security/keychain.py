@@ -28,7 +28,7 @@ def _windows_credential(service: str, account: str):
 def keychain_get(service: str, account: str) -> str | None:
     if WINDOWS:
         credential = _windows_credential(service, account)
-        return credential["CredentialBlob"].decode("utf-8") if credential else None
+        return credential["CredentialBlob"].decode("utf-16-le") if credential else None
     try:
         result = subprocess.run(
             ["security", "find-generic-password", "-s", service, "-a", account, "-w"],
@@ -60,7 +60,7 @@ def keychain_set(service: str, account: str, secret: str) -> None:
             "Type": win32cred.CRED_TYPE_GENERIC,
             "TargetName": _target(service, account),
             "UserName": account,
-            "CredentialBlob": secret.strip().encode("utf-8"),
+            "CredentialBlob": secret.strip(),
             "Persist": win32cred.CRED_PERSIST_LOCAL_MACHINE,
         }, 0)
         return

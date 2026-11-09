@@ -81,6 +81,9 @@ def test_windows_sqlcipher_key_persists_in_credential_manager(tmp_path, monkeypa
         monkeypatch.setattr(config, name, value)
     monkeypatch.setattr(db, "_KEY_CACHE", {"loaded": False, "key": None, "source": None, "error": None})
     try:
+        keychain.keychain_set(service_name, "roundtrip", "synthetic vault text — windows")
+        assert keychain.keychain_get(service_name, "roundtrip") == "synthetic vault text — windows"
+        assert db.encryption_enabled(), db.key_status()["error"]
         db.init_database()
         key = keychain.keychain_get(service_name, config.DB_KEYCHAIN_ACCOUNT)
         assert key and len(key) == 64
@@ -94,6 +97,7 @@ def test_windows_sqlcipher_key_persists_in_credential_manager(tmp_path, monkeypa
         finally:
             conn.close()
     finally:
+        keychain.keychain_delete(service_name, "roundtrip")
         keychain.keychain_delete(service_name, config.DB_KEYCHAIN_ACCOUNT)
 
 
