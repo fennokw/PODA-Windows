@@ -5,8 +5,9 @@
   "private": true,
   "main": "main.cjs",
   "scripts": {
-    "start": "electron .",
-    "package:windows": "node package-windows.cjs"
+    "start": "npm run stage:backend && electron .",
+    "package:windows": "node package-windows.cjs",
+    "stage:backend": "python stage_backend.py .backend"
   },
   "devDependencies": {
     "@electron/packager": "20.3.0",
@@ -17,5 +18,9 @@
       "glob": "14.0.2",
       "minimatch": "11.0.1"
     }
-  }
+  },
+  "podaSetupFiles": [
+    "Setup-PODA.cmd",
+    "setup-windows.ps1"
+  ]
 }
