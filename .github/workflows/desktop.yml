@@ -9,13 +9,13 @@ jobs:
   windows-x64:
     runs-on: windows-2025
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
         with:
           node-version: '24'
           cache: npm
           cache-dependency-path: desktop/package-lock.json
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: '3.12'
           architecture: x64
@@ -23,17 +23,22 @@ jobs:
         shell: pwsh
         working-directory: desktop
         run: |
-          npm ci --ignore-scripts
+          python ../tools/release_guard.py --check
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          npm run package:windows
+          $env:PODA_DATA_DIR = Join-Path $env:RUNNER_TEMP 'poda-ci'
+          & ../Install-PODA.cmd -NoLaunch
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           $bundle = '../dist/desktop/PODA-win32-x64'
           foreach ($file in @('PODA.exe', 'resources/app.asar', 'resources/backend/Setup-PODA.cmd', 'resources/backend/setup-windows.ps1')) {
             if (-not (Test-Path (Join-Path $bundle $file) -PathType Leaf)) { throw "Missing $file" }
           }
-          $env:PODA_DATA_DIR = Join-Path $env:RUNNER_TEMP 'poda-ci'
           $env:PODA_TEST_BACKEND = (Resolve-Path (Join-Path $bundle 'resources/backend')).Path
-          & (Join-Path $env:PODA_TEST_BACKEND 'setup-windows.ps1')
+          $desktopPath = [Environment]::GetFolderPath('DesktopDirectory', 'DoNotVerify')
+          $shell = New-Object -ComObject WScript.Shell
+          $shortcut = $shell.CreateShortcut((Join-Path $desktopPath 'PODA.lnk'))
+          if ($shortcut.TargetPath -ne (Resolve-Path (Join-Path $bundle 'PODA.exe')).Path) {
+            throw 'The PODA desktop shortcut does not target the installed executable.'
+          }
           $runtime = Get-ChildItem (Join-Path $env:PODA_DATA_DIR 'desktop-runtime') -Directory | Select-Object -First 1
           & (Join-Path $runtime.FullName 'Scripts/python.exe') -m pytest -q --basetemp (Join-Path $env:RUNNER_TEMP 'poda-pytest') test_backend.py
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
@@ -60,7 +65,7 @@ jobs:
             }
           }
           Compress-Archive -Path $bundle -DestinationPath ../dist/PODA-Windows-x64.zip
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v6
         with:
           name: PODA-Windows-x64
           path: dist/PODA-Windows-x64.zip

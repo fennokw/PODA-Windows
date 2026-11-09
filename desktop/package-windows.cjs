@@ -1,6 +1,6 @@
 'use strict';
 
-const { packager } = require('@electron/packager');
+const { packager } = require('./package-electron.cjs');
 const { copyFileSync, mkdirSync, mkdtempSync, rmSync } = require('node:fs');
 const { execFileSync } = require('node:child_process');
 const { tmpdir } = require('node:os');
@@ -18,7 +18,8 @@ async function build() {
     for (const file of ['main.cjs', 'package.json']) {
       copyFileSync(path.join(__dirname, file), path.join(appDir, file));
     }
-    execFileSync(process.platform === 'win32' ? 'python' : 'python3', [path.join(__dirname, 'stage_backend.py'), backendDir], { stdio: 'inherit' });
+    const [python, ...pythonArgs] = process.platform === 'win32' ? ['py.exe', '-3.12'] : ['python3'];
+    execFileSync(python, [...pythonArgs, path.join(__dirname, 'stage_backend.py'), backendDir], { stdio: 'inherit' });
     const output = await packager({
       dir: appDir, out: path.join(root, 'dist', 'desktop'), overwrite: true,
       name: 'PODA', platform: 'win32', arch: 'x64', electronVersion: devDependencies.electron,
