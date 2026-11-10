@@ -2,15 +2,49 @@
 (function () {
   'use strict';
   const { $, $$, el, api, ApiError, errorDetail, errorNode, toast, confirmDialog, promptDialog, skeleton, emptyState, pill, statusPill, route, renderRoute, navigate, registerCommand, openPalette, loadBuild, fmtTime, fmtBytes } = window.PODA;
-  const md = window.PODAMarkdown;
+  const rich = window.PODAChatRendering;
 
   // ---------- Navigation ----------
   $('#memoryBtn').addEventListener('click', () => { window.location.assign('/memory-viewer'); });
   $$('.nav-item').forEach((b) => { if (b.id !== 'memoryBtn') b.addEventListener('click', () => navigate(b.dataset.route)); });
   $('#paletteBtn').addEventListener('click', openPalette);
-  $('#inspectorToggle').addEventListener('click', () => $('#inspector').classList.toggle('open'));
-  $('#inspectorClose').addEventListener('click', () => $('#inspector').classList.remove('open'));
+  const navMenu = $('#navMenu');
+  const setMenu = (open) => {
+    navMenu.setAttribute('aria-expanded', String(open));
+    $('#nav').classList.toggle('menu-open', open);
+  };
+  navMenu.addEventListener('click', () => setMenu(navMenu.getAttribute('aria-expanded') !== 'true'));
+  const showDetails = (open) => {
+    $('#inspector').hidden = !open;
+    $('.shell').classList.toggle('inspector-open', open);
+    $('#inspectorToggle').setAttribute('aria-expanded', String(open));
+  };
+  $('#inspectorToggle').addEventListener('click', () => showDetails($('#inspector').hidden));
+  $('#inspectorClose').addEventListener('click', () => { showDetails(false); $('#inspectorToggle').focus(); });
+  document.addEventListener('poda:navigation', () => { setMenu(false); showDetails(false); });
+  $('.skip-link').addEventListener('click', (event) => { event.preventDefault(); $('#view').focus(); });
+  const developerToggle = $('#developerToggle');
+  function applyDeveloperMode(enabled) {
+    document.documentElement.classList.toggle('developer-mode', enabled);
+    developerToggle.setAttribute('aria-pressed', String(enabled));
+  }
+  developerToggle.addEventListener('click', async () => {
+    developerToggle.disabled = true;
+    try {
+      const saved = await api('/system/view-preferences', { method: 'PUT',
+        body: { developer_mode: developerToggle.getAttribute('aria-pressed') !== 'true' } });
+      applyDeveloperMode(saved.developer_mode);
+      toast(saved.developer_mode ? 'Developer mode is on.' : 'Developer mode is off.', 'ok');
+    } catch (err) { toast(errorDetail(err).message, 'danger'); }
+    finally { developerToggle.disabled = false; }
+  });
+  api('/system/view-preferences').then(data => applyDeveloperMode(data.developer_mode)).catch(() => {});
   window.addEventListener('hashchange', renderRoute);
+  window.addEventListener('unhandledrejection', (event) => {
+    event.preventDefault();
+    const detail = errorDetail(event.reason);
+    toast(document.documentElement.classList.contains('developer-mode') ? detail.message : 'That action could not finish. Try again.', 'danger');
+  });
   document.addEventListener('keydown', (e) => {
     if (e.metaKey || e.ctrlKey || e.altKey) return;
     const tag = document.activeElement?.tagName;
@@ -19,15 +53,85 @@
     if (map[e.key]) { e.preventDefault(); if (map[e.key] === 'memory') window.location.assign('/memory-viewer'); else navigate(map[e.key]); }
   });
 
-  const screens = [['ask', 'Ask', '1'], ['personalize', 'Personalize', '9'], ['projects', 'Project Manager', '3'], ['notion', 'Notion', '4'], ['mail', 'Mail', '5'], ['files', 'Files & Agent', '6'], ['privacy', 'Privacy', '7'], ['daily', 'Daily Automation', '0'], ['system', 'System', '8']];
+  const screens = [['ask', 'Chat', '1'], ['personalize', 'Personalize', '9'], ['projects', 'Projects', '3'], ['notion', 'Calendar', '4'], ['mail', 'Mail', '5'], ['files', 'Files & access', '6'], ['addons', 'Add-ons', ''], ['privacy', 'Privacy', '7'], ['daily', 'Daily Automation', '0'], ['system', 'System', '8']];
   for (const [name, label, key] of screens) registerCommand({ label: `Go to ${label}`, kind: 'Screen', key, keywords: name === 'mail' ? 'email inbox gmail apple mail' : '', run: () => navigate(name) });
   registerCommand({ label: 'Open memory viewer', kind: 'Screen', key: '2', keywords: 'open3d 3d second brain', run: () => window.location.assign('/memory-viewer') });
-  registerCommand({ label: 'Check capabilities', kind: 'Action', keywords: 'ledger status', run: async () => { const c = await api('/capabilities'); toast(`Ollama ${c.ollama?.reachable ? 'reachable' : 'unreachable'} · Notion ${c.notion?.status || 'DISCONNECTED'} · ${c.filesystem?.granted_roots?.length || 0} path grants`); navigate('system'); } });
+  registerCommand({ label: 'Check capabilities', kind: 'Action', keywords: 'ledger status', run: async () => { const c = await api('/capabilities'); toast(`llama.cpp ${c.inference?.reachable ? 'reachable' : 'unreachable'} · Notion ${c.notion?.status || 'DISCONNECTED'} · ${c.filesystem?.granted_roots?.length || 0} path grants`); navigate('system'); } });
   registerCommand({ label: 'Create encrypted backup', kind: 'Action', keywords: 'privacy export', run: async () => { const r = await api('/privacy/backup', { method: 'POST' }); toast(`Backup written: ${r.path.split('/').pop()}`, 'ok'); } });
   registerCommand({ label: 'Toggle offline mode', kind: 'Action', keywords: 'network egress', run: async () => { const s = await api('/privacy/status'); const next = !s.egress?.offline_mode; await api('/privacy/offline', { method: 'POST', body: { enabled: next } }); toast(`Offline mode ${next ? 'enabled' : 'disabled'}`, 'ok'); } });
   registerCommand({ label: 'Refresh capability ledger', kind: 'Action', run: async () => { await api('/capabilities/ledger'); toast('Ledger refreshed from runtime', 'ok'); } });
 
   // ---------- Shared helpers ----------
+  async function* chatEvents(runId, signal) {
+    let cursor = 0;
+    const path = '/chat/runs/' + encodeURIComponent(runId) + '/stream?after=';
+    for (let attempt = 0; attempt < 3; attempt++) {
+      let reader;
+      try {
+        const res = await api(path + cursor, { signal, raw: true });
+        if (!res.ok || !res.body) {
+          const detail = await res.json().catch(() => null);
+          throw new ApiError(res.status, detail?.detail || `HTTP ${res.status}`);
+        }
+        reader = res.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = '';
+        for (;;) {
+          const { value, done } = await reader.read();
+          if (done) break;
+          buffer += decoder.decode(value, { stream: true });
+          const frames = buffer.split('\n\n');
+          buffer = frames.pop() || '';
+          for (const frame of frames) {
+            let event = 'message', dataText = '', id = 0;
+            for (const line of frame.split('\n')) {
+              if (line.startsWith('event:')) event = line.slice(6).trim();
+              else if (line.startsWith('data:')) dataText += line.slice(5).trim();
+              else if (line.startsWith('id:')) id = Number(line.slice(3).trim());
+            }
+            if (!dataText || (id && id <= cursor)) continue;
+            let data;
+            try { data = JSON.parse(dataText); } catch { continue; }
+            if (id) cursor = id;
+            yield [event, data];
+            if (event === 'done' || event === 'error' || (event === 'status' && data.message === 'cancelled')) return;
+          }
+        }
+      } catch (err) {
+        if (signal.aborted || err.name === 'AbortError' || (err instanceof ApiError && err.status < 500)) throw err;
+      } finally {
+        await reader?.cancel().catch(() => {});
+      }
+      if (attempt < 2) {
+        yield ['reconnecting', {}];
+        await new Promise((resolve) => setTimeout(resolve, 400 * (attempt + 1)));
+      }
+    }
+    throw new Error('The chat connection dropped. Reopen this chat to reconnect to the running task.');
+  }
+
+  const chatPhase = {
+    reading_attachments: 'Reading attached files',
+    reading_images: 'Reading images',
+    generating_reply: 'Generating reply',
+    writing_archive: 'Writing files for your ZIP',
+    saving_archive: 'Verifying and saving your ZIP',
+    planning_tools: 'Planning tool steps',
+    planner_ready: 'Planning tool steps',
+    planner_fallback: 'Retrying tool planning with another model',
+  };
+
+  function sandboxDownloadLink(filename) {
+    return el('a', { class: 'btn btn-sm', href: '/agent/sandbox/download/' + encodeURIComponent(filename),
+      download: filename, 'data-chat-download': 'true' }, `Download ${filename}`);
+  }
+  function sandboxReceiptLink(receipt) {
+    if (receipt.tool !== 'sandbox_write' || receipt.outcome !== 'succeeded') return null;
+    try {
+      const { filename } = JSON.parse(receipt.detail);
+      return filename ? sandboxDownloadLink(filename) : null;
+    } catch { return null; }
+  }
   function section(title, meta, ...children) {
     return el('section', { class: 'card stack' }, el('div', { class: 'card-head' }, el('h2', {}, title), meta ? el('span', { class: 'meta' }, meta) : null), ...children);
   }
@@ -37,10 +141,10 @@
     return dl;
   }
   function yesNo(v) { return pill(v ? 'yes' : 'no', v ? 'ok' : 'danger'); }
-  function jsonBox(obj) { return el('pre', { class: 'json' }, JSON.stringify(obj, null, 2)); }
+  function jsonBox(obj) { return el('pre', { class: 'json dev-only' }, JSON.stringify(obj, null, 2)); }
   async function load(target, fn) {
     target.innerHTML = ''; target.appendChild(skeleton(3, true));
-    try { const node = await fn(); target.innerHTML = ''; if (node) target.appendChild(node); }
+    try { const node = await fn(); target.innerHTML = ''; if (node) target.appendChild(node.tagName === 'TABLE' ? el('div', { class: 'table-scroll', tabindex: 0 }, node) : node); }
     catch (err) { target.innerHTML = ''; target.appendChild(errorNode(err)); }
   }
 
@@ -64,13 +168,48 @@
   };
 
   route('ask', async ({ view, inspector, setTitle, setInspectorTitle }) => {
-    setTitle('Ask'); setInspectorTitle('Context');
+    setTitle('Chat'); setInspectorTitle('Chat details');
     $('#viewCrumb').textContent = 'Grounded local chat';
     const messages = el('div', { class: 'messages', id: 'messages', 'aria-live': 'polite' });
     const textarea = el('textarea', { placeholder: 'Ask PODA. Shift+Enter for a new line.', rows: 1, 'aria-label': 'Message' });
     const sendBtn = el('button', { class: 'btn btn-primary', type: 'submit' }, 'Send');
     const stopBtn = el('button', { class: 'btn btn-danger', type: 'button', hidden: true }, 'Stop');
-    const statusLine = el('div', { class: 'status-line' });
+    const statusLine = el('div', { class: 'status-line', role: 'status' });
+    const fileInput = el('input', { type: 'file', multiple: true, hidden: true, 'aria-label': 'Choose chat attachments' });
+    const attachBtn = el('button', { class: 'btn btn-ghost btn-sm', type: 'button', title: 'Attach files or drop them into this chat' }, 'Attach files');
+    const draftAttachments = el('div', { class: 'chat-files', 'aria-label': 'Files for this message', hidden: true });
+    const draftFiles = [];
+    function drawDraftFiles() {
+      draftAttachments.replaceChildren(...draftFiles.map((file, index) => {
+        const remove = el('button', { class: 'btn btn-sm btn-ghost', type: 'button', 'aria-label': 'Remove ' + file.name }, '×');
+        remove.onclick = () => { draftFiles.splice(index, 1); drawDraftFiles(); };
+        return el('span', { class: 'chat-file' }, el('span', {}, file.name), remove);
+      }));
+      draftAttachments.hidden = !draftFiles.length;
+    }
+    function addFiles(files) {
+      if (askState.controller) { toast('Wait for the current reply before adding files.', 'warn'); return; }
+      let skipped = false;
+      for (const file of files) {
+        if (!file.size || file.size > 16 * 1024 * 1024 || draftFiles.length >= 4
+            || file.size + draftFiles.reduce((size, item) => size + item.size, 0) > 32 * 1024 * 1024) {
+          skipped = true;
+          continue;
+        }
+        if (!draftFiles.some((item) => item.name === file.name && item.size === file.size && item.lastModified === file.lastModified)) {
+          draftFiles.push(file);
+        }
+      }
+      drawDraftFiles();
+      if (skipped) toast('Attach up to four files, 16 MiB each and 32 MiB total. Empty files are skipped.', 'warn');
+      textarea.focus();
+    }
+    attachBtn.onclick = () => fileInput.click();
+    fileInput.onchange = () => { addFiles([...fileInput.files]); fileInput.value = ''; };
+    textarea.addEventListener('paste', (event) => {
+      const files = [...(event.clipboardData?.files || [])];
+      if (files.length) { event.preventDefault(); addFiles(files); }
+    });
     const seg = (name, options, value, onChange) => {
       const wrap = el('div', { class: 'seg', role: 'group', 'aria-label': name });
       for (const [val, label] of options) {
@@ -81,12 +220,28 @@
       return wrap;
     };
     const memoryToggle = el('label', { class: 'check' }, el('input', { type: 'checkbox', checked: askState.useMemory, onchange: (e) => { askState.useMemory = e.target.checked; } }), 'Use memory');
-    const composer = el('form', { class: 'composer' }, textarea,
-      el('div', { class: 'composer-bar' },
+    const composer = el('form', { class: 'composer' }, fileInput, draftAttachments, textarea,
+      el('div', { class: 'composer-bar' }, attachBtn,
         seg('Model', [['auto', 'Auto'], ['fast', 'Fast'], ['advanced', 'Advanced'], ['deep', 'Deep']], askState.mode, (v) => { askState.mode = v; }),
         (() => { const w = seg('Thinking', [['fast', 'Quick'], ['balanced', 'Balanced'], ['deep', 'Deep think']], askState.thinking, (v) => { askState.thinking = v; }); const deep = $$('button', w)[2]; if (deep) deep.title = 'Also reads in-depth memory (the full question and answer pairs behind each surface memory)'; return w; })(),
         memoryToggle, el('span', { class: 'spacer' }), el('button', { class: 'btn btn-ghost', type: 'button', title: 'Start a fresh conversation. Nothing is deleted: this chat stays in your memory web and can be recalled later.', onclick: () => newChat() }, 'New chat'), stopBtn, sendBtn));
-    view.appendChild(el('div', { class: 'screen ask' }, messages, el('div', { class: 'stack-sm' }, statusLine, composer)));
+    const chatScreen = el('div', { class: 'screen ask' }, messages, el('div', { class: 'stack-sm' }, statusLine, composer));
+    view.appendChild(chatScreen);
+    chatScreen.addEventListener('dragover', (event) => {
+      if (!event.dataTransfer?.types.includes('Files')) return;
+      event.preventDefault();
+      event.dataTransfer.dropEffect = 'copy';
+      composer.classList.add('file-drop');
+    });
+    chatScreen.addEventListener('dragleave', (event) => {
+      if (!chatScreen.contains(event.relatedTarget)) composer.classList.remove('file-drop');
+    });
+    chatScreen.addEventListener('drop', (event) => {
+      composer.classList.remove('file-drop');
+      if (!event.dataTransfer?.files.length) return;
+      event.preventDefault();
+      addFiles([...event.dataTransfer.files]);
+    });
 
     // Inspector
     const recallBox = el('div', { class: 'stack-sm' }, el('p', { class: 'faint small' }, 'Send a message to see which memories were recalled and why.'));
@@ -126,18 +281,46 @@
     textarea.addEventListener('input', () => { textarea.style.height = 'auto'; textarea.style.height = Math.min(textarea.scrollHeight, 180) + 'px'; });
     textarea.addEventListener('keydown', (e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); composer.requestSubmit(); } });
 
-    function addMessage(role, content, meta) {
+    let stickToLatest = true;
+    let lastAutoScroll = 0;
+    function scrollToLatest() {
+      if (!stickToLatest) return;
+      messages.scrollTop = messages.scrollHeight;
+      lastAutoScroll = messages.scrollTop;
+    }
+    messages.addEventListener('scroll', () => {
+      if (Math.abs(messages.scrollTop - lastAutoScroll) < 1) return;
+      stickToLatest = messages.scrollHeight - messages.clientHeight - messages.scrollTop < 56;
+    });
+    messages.addEventListener('poda:preview-ready', scrollToLatest);
+
+    function addMessage(role, content, meta, attachments = []) {
       const wrap = el('div', { class: `msg msg-${role}` });
       const bubble = el('div', { class: 'bubble' });
-      if (role === 'user') bubble.textContent = content; else bubble.innerHTML = md.render(content);
       const metaRow = el('div', { class: 'msg-meta' }, el('span', {}, role === 'user' ? 'You' : 'PODA'), meta ? el('span', {}, fmtTime(meta)) : null);
+      if (attachments.length) {
+        wrap.append(el('div', { class: 'chat-files', 'aria-label': 'Attached files' },
+          ...attachments.map((name) => el('span', { class: 'chat-file' }, name))));
+      }
       wrap.append(bubble, metaRow);
       messages.appendChild(wrap);
-      messages.scrollTop = messages.scrollHeight;
+      if (role === 'user') bubble.textContent = content;
+      else rich.renderInto(bubble, content || '');
+      scrollToLatest();
       return { wrap, bubble, metaRow };
     }
     function addDownload(row, download, sessionId) {
       if (!download?.message_id || !sessionId || row.querySelector('[data-chat-download]')) return;
+      if (download.error) row.append(el('span', { class: 'small', role: 'status' }, download.error));
+      if (download.sandbox_file) {
+        const filename = download.sandbox_file;
+        row.append(sandboxDownloadLink(filename));
+        const alreadyShown = [...row.parentElement.querySelectorAll('.chat-visual-inline')]
+          .some((node) => node.dataset.filename === filename);
+        const preview = alreadyShown ? null : rich.attachmentPreview(filename);
+        if (preview) row.before(preview);
+        return;
+      }
       const url = `/chat/session/${encodeURIComponent(sessionId)}/messages/${encodeURIComponent(download.message_id)}/download`;
       row.append(el('a', { class: 'btn btn-sm', href: url, download: download.filename,
         'data-chat-download': 'true' }, download.filename === 'poda-response.md' ? 'Download reply' : `Download ${download.filename}`));
@@ -189,7 +372,7 @@
         const history = await api('/chat/session/' + encodeURIComponent(askState.sessionId) + '/messages?limit=120');
         savedWorkflows = history.workflows || [];
         askState.transcript = (history.messages || []).filter((m) => m.role === 'user' || m.role === 'assistant')
-          .map((m) => ({ role: m.role, content: m.content, at: m.created_at, activity: m.workflow_activity, download: m.download }));
+          .map((m) => ({ role: m.role, content: m.content, at: m.created_at, activity: m.workflow_activity, download: m.download, attachments: m.attachments }));
         if (askState.runId) {
           const run = await api('/chat/runs/' + encodeURIComponent(askState.runId)).catch(() => null);
           if (!run || (run.state !== 'running' && askState.transcript.at(-1)?.role === 'assistant')) {
@@ -199,7 +382,7 @@
       } catch { /* Server might have restarted; active run status will report that accurately. */ }
     }
     if (askState.transcript.length) for (const m of askState.transcript) {
-      const { wrap, metaRow } = addMessage(m.role, m.content, m.at);
+      const { wrap, metaRow } = addMessage(m.role, m.content, m.at, m.attachments);
       restoreActivity(wrap, m.activity);
       addDownload(metaRow, m.download, askState.sessionId);
     }
@@ -209,13 +392,14 @@
       if (parent === checkpointBox) checkpointBox.hidden = false;
       renderProposal(parent, { ...workflow, proposal_id: workflow.id });
     }
-    messages.scrollTop = messages.scrollHeight;
+    scrollToLatest();
     function newChat() {
       if (askState.runId) api('/chat/runs/' + encodeURIComponent(askState.runId) + '/cancel', { method: 'POST' }).catch(() => {});
       askState.controller?.abort();
       // Finalize rolling short-term turns into visible second-brain memories.
       if (askState.sessionId) api('/chat/session/' + encodeURIComponent(askState.sessionId) + '/flush', { method: 'POST' }).catch(() => {});
       askState.sessionId = null; askState.runId = null; askState.transcript = [];
+      draftFiles.length = 0; drawDraftFiles();
       proposalCards.clear(); proposalMessages.clear();
       checkpointBox.replaceChildren(el('h3', {}, 'Workflow checkpoints')); checkpointBox.hidden = true;
       persistSession();
@@ -283,9 +467,16 @@
       }
     }
 
-    async function send(text, continuationOf, resumeId = null, resumeWorkflow = false) {
+    async function send(text, continuationOf, resumeId = null, resumeWorkflow = false, files = []) {
       if (askState.controller) return;
-      if (!continuationOf && !resumeId) { const at = new Date().toISOString(); addMessage('user', text, at); askState.transcript.push({ role: 'user', content: text, at }); }
+      stickToLatest = true;
+      let userWrap;
+      if (!continuationOf && !resumeId) {
+        const at = new Date().toISOString();
+        const attachments = files.map((file) => file.name);
+        userWrap = addMessage('user', text, at, attachments).wrap;
+        askState.transcript.push({ role: 'user', content: text, at, attachments });
+      }
       const empty = $('.hero-empty', messages); if (empty) empty.remove();
       const { wrap, bubble, metaRow } = addMessage('assistant', '', null);
       bubble.classList.add('streaming');
@@ -293,43 +484,58 @@
       const badges = el('div', { class: 'msg-badges' });
       wrap.insertBefore(thoughts, bubble); wrap.append(badges);
       const addActivity = workflowActivity(wrap);
-      let full = '', thoughtText = '', raf = 0, finished = false;
-      const paint = () => { raf = 0; bubble.innerHTML = md.render(full); messages.scrollTop = messages.scrollHeight; };
+      let full = '', thoughtText = '', raf = 0, finished = false, responseError = '';
+      let phase = '';
+      const paint = () => { raf = 0; rich.renderInto(bubble, full, { streaming: true }); scrollToLatest(); };
       const schedule = () => { if (!raf) raf = requestAnimationFrame(paint); };
-      const setStatus = (t, live) => { statusLine.innerHTML = ''; if (live) statusLine.appendChild(el('span', { class: 'live' })); statusLine.appendChild(el('span', {}, t)); };
+      const setStatus = (text, live, elapsed = 0) => {
+        if (!elapsed) phase = text;
+        const time = elapsed ? ` · ${Math.floor(elapsed / 60)}m ${elapsed % 60}s elapsed` : '';
+        statusLine.replaceChildren(...(live ? [el('span', { class: 'live' })] : []), el('span', {}, text + time));
+      };
       const subscription = new AbortController();
       askState.controller = subscription;
-      sendBtn.disabled = true; stopBtn.hidden = false; setStatus('Contacting PODA…', true);
+      sendBtn.disabled = attachBtn.disabled = true; stopBtn.hidden = false;
+      setStatus(files.length ? 'Uploading files locally…' : 'Contacting PODA…', true);
       const body = { message: text, mode: askState.mode, thinking_level: askState.thinking, use_memory: askState.useMemory, session_id: askState.sessionId };
       if (continuationOf) body.continuation_of = continuationOf;
       if (resumeWorkflow) body.resume_workflow = true;
       try {
         if (!resumeId) {
-          const started = await api('/chat/runs', { method: 'POST', body });
+          const form = files.length ? new FormData() : null;
+          if (form) {
+            form.set('prompt', JSON.stringify(body));
+            for (const file of files) form.append('files', file, file.name);
+          }
+          const started = await api(form ? '/chat/runs/with-files' : '/chat/runs',
+            { method: 'POST', body: form || body, signal: subscription.signal });
+          if (files.length) { draftFiles.length = 0; drawDraftFiles(); }
           askState.runId = started.run_id;
           askState.sessionId = started.session_id || askState.sessionId;
           persistSession();
         } else {
           askState.runId = resumeId;
         }
-        // Subscriber can be aborted by route change; server-owned generation continues.
-        const res = await api('/chat/runs/' + encodeURIComponent(askState.runId) + '/stream?after=0',
-          { method: 'GET', signal: subscription.signal, raw: true });
-        if (!res.ok || !res.body) { let d = null; try { d = await res.json(); } catch { /* ignore */ } throw new window.PODA.ApiError(res.status, d?.detail || `HTTP ${res.status}`); }
-        const reader = res.body.getReader(); const decoder = new TextDecoder(); let buffer = '';
-        for (;;) {
-          const { value, done } = await reader.read();
-          if (done) break;
-          buffer += decoder.decode(value, { stream: true });
-          const frames = buffer.split('\n\n'); buffer = frames.pop() || '';
-          for (const frame of frames) {
-            let event = 'message', dataText = '';
-            for (const line of frame.split('\n')) { if (line.startsWith('event:')) event = line.slice(6).trim(); else if (line.startsWith('data:')) dataText += line.slice(5).trim(); }
-            if (!dataText) continue;
-            let data; try { data = JSON.parse(dataText); } catch { continue; }
+        // This subscriber can reconnect while generation remains owned by the server.
+        for await (const [event, data] of chatEvents(askState.runId, subscription.signal)) {
             switch (event) {
               case 'session': if (data.session_id) { askState.sessionId = data.session_id; persistSession(); } break;
-              case 'status': addActivity([String(data.message || '').replaceAll('_', ' '), data.model, data.detail].filter(Boolean).join(' · ')); if (data.message === 'cancelled') finished = true; setStatus(data.message === 'routing' ? `Routing to ${data.model} (${data.profile || ''}, ${data.num_ctx ? data.num_ctx / 1024 + 'K ctx' : ''})` : data.message === 'recalling' ? 'Recalling memories…' : data.message === 'cancelled' ? 'Cancelled' : `${data.message} · ${data.model || ''}`, data.message !== 'cancelled'); break;
+              case 'status': {
+                const label = chatPhase[data.message] || String(data.message || '').replaceAll('_', ' ');
+                addActivity([String(data.message || '').replaceAll('_', ' '), data.model, data.detail].filter(Boolean).join(' · '));
+                if (data.message === 'cancelled') finished = true;
+                const text = data.message === 'routing' ? `Preparing ${data.model}…` :
+                  data.message === 'recalling' ? 'Recalling memories…' :
+                  data.message === 'cancelled' ? 'Cancelled' : `${label}${data.model ? ' · ' + data.model : ''}`;
+                setStatus(text, !finished);
+                break;
+              }
+              case 'heartbeat': setStatus(phase || 'PODA is working', true, data.elapsed_seconds || 0); break;
+              case 'reconnecting': setStatus('Reconnecting to your running task…', true); break;
+              case 'archive_progress': setStatus(`Writing files for your ZIP · ${data.characters.toLocaleString()} characters generated`, true); break;
+              case 'attachment_warning':
+                wrap.insertBefore(el('p', { class: 'notice small chat-input-warning', role: 'status' }, data.message), bubble);
+                break;
               case 'recall': addActivity(recallActivity(data.knowledge_facts?.length || 0, data.results?.length || 0, data.graph_ms)); renderRecall(data); badges.appendChild(pill(`${(data.surfaces || (data.results || []).filter((r) => r.tier === 'surface')).length ? `${(data.surfaces || (data.results || []).filter((r) => r.tier === 'surface')).length} surface · ` : ''}${(data.results || []).filter((r) => r.tier !== 'surface').length} memories recalled`, 'lav')); if (data.depth_used === 'deep') badges.appendChild(pill('deep dive', 'lav')); break;
               case 'thought': thoughtText += data.token || ''; thoughts.hidden = false; $('pre', thoughts).textContent = thoughtText.slice(-6000); break;
               case 'token': full += data.token || ''; schedule(); break;
@@ -346,30 +552,46 @@
                 if (resumeWorkflow) proposalCards.get(continuationOf)?.querySelector('[data-resume-workflow]')?.remove();
                 break;
               case 'done': {
+                if (raf) { cancelAnimationFrame(raf); raf = 0; }
                 addActivity('Response finished · ' + (data.model || 'PODA'));
                 finished = true;
                 const tps = data.eval_count && data.eval_duration_ms ? (data.eval_count / (data.eval_duration_ms / 1000)).toFixed(1) : null;
                 metaRow.append(el('span', {}, fmtTime(new Date().toISOString())), pill(data.model || 'PODA', data.profile === 'gate' || data.profile === 'ledger' ? 'accent' : 'muted'), tps ? el('span', { class: 'mono' }, `${tps} tok/s`) : null);
                 badges.prepend(pill(data.profile === 'gate' ? 'Action gate' : data.profile === 'ledger' ? 'Capability ledger' : `Model · ${data.profile || 'auto'}`, 'accent'));
-                sessionBox.innerHTML = ''; sessionBox.appendChild(kv([['Model', data.model || ''], ['Profile', data.profile || ''], ['Output tokens', data.eval_count ?? 'n/a'], ['Speed', tps ? `${tps} tok/s` : 'n/a'], ['Prompt tokens', data.prompt_eval_count ?? 'n/a'], ['Session', askState.sessionId ? askState.sessionId.slice(0, 8) : 'new']]));
+                sessionBox.innerHTML = ''; sessionBox.appendChild(kv([['Model', data.model || ''], ['Profile', data.profile || ''], ['Output tokens', data.eval_count ?? 'n/a'], ['Speed', tps ? `${tps} tok/s` : 'n/a'], ['Prompt tokens', data.prompt_eval_count ?? 'n/a'], ['Speculation', data.speculation || 'off'], ['Session', askState.sessionId ? askState.sessionId.slice(0, 8) : 'new']]));
                 setStatus(`Done · ${data.model || ''}`, false);
+                rich.renderInto(bubble, full);
                 addDownload(metaRow, data.download, askState.sessionId);
                 askState.transcript.push({ role: 'assistant', content: full, at: new Date().toISOString(), download: data.download });
                 break;
               }
-              case 'error': full = full || ''; bubble.innerHTML = ''; bubble.appendChild(el('div', { class: 'notice notice-danger' }, data.message || 'PODA error')); setStatus('Error', false); finished = true; break;
+              case 'error': responseError = data.message || 'PODA error'; setStatus('Error', false); finished = true; break;
               default: break;
             }
-          }
         }
         if (raf) cancelAnimationFrame(raf);
-        bubble.innerHTML = md.render(full) || bubble.innerHTML;
+        if (full) rich.renderInto(bubble, full);
+        if (responseError) bubble.appendChild(el('div', { class: 'notice notice-danger chat-input-warning' }, responseError));
         if (!finished) setStatus('Stream ended', false);
       } catch (err) {
-        if (err.name === 'AbortError') { bubble.innerHTML = md.render(full) + (full ? '' : '<p class="faint">Cancelled.</p>'); setStatus('Cancelled', false); }
-        else { bubble.innerHTML = ''; bubble.appendChild(errorNode(err)); setStatus('Failed', false); }
+        if (err.name === 'AbortError') {
+          if (full) rich.renderInto(bubble, full);
+          else bubble.replaceChildren(el('p', { class: 'faint' }, 'Cancelled.'));
+          setStatus('Cancelled', false);
+        }
+        else {
+          if (err instanceof ApiError && err.status === 404) finished = true;
+          if (full) rich.renderInto(bubble, full);
+          if (files.length && !askState.runId && userWrap) {
+            userWrap.remove();
+            askState.transcript.pop();
+            if (!textarea.value) textarea.value = text;
+          }
+          bubble.appendChild(errorNode(err)); setStatus('Failed', false);
+        }
       } finally {
-        bubble.classList.remove('streaming'); if (askState.controller === subscription) askState.controller = null; sendBtn.disabled = false; stopBtn.hidden = true; messages.scrollTop = messages.scrollHeight;
+        if (raf) cancelAnimationFrame(raf);
+        bubble.classList.remove('streaming'); if (askState.controller === subscription) askState.controller = null; sendBtn.disabled = attachBtn.disabled = false; stopBtn.hidden = true; scrollToLatest();
         if (finished) { askState.runId = null; persistSession(); }
         if (!thoughtText) thoughts.remove(); else $('.live', thoughts)?.remove();
       }
@@ -386,7 +608,11 @@
         ...(data.receipts || []).map((receipt) =>
           el('span', { class: 'receipt-chip', title: receipt.verification || '' },
             pill(receipt.outcome, receipt.outcome === 'succeeded' ? 'ok' : 'warn'), receipt.tool,
-            el('span', { class: 'mono' }, '#' + receipt.id.slice(0, 8)))));
+            el('span', { class: 'mono' }, '#' + receipt.id.slice(0, 8)))),
+        ...(data.receipts || []).flatMap((receipt) => {
+          const link = sandboxReceiptLink(receipt);
+          return link ? [rich.attachmentPreview(link.download), link] : [];
+        }));
       const proposalUrl = '/agent/proposals/' + encodeURIComponent(data.proposal_id);
       if (status === 'pending') {
         const approve = el('button', { class: 'btn btn-primary btn-sm' }, 'Approve and run');
@@ -434,15 +660,23 @@
       return sessionId === askState.sessionId && view.contains(messages);
     }
 
-    composer.addEventListener('submit', (e) => { e.preventDefault(); const text = textarea.value.trim(); if (!text) return; textarea.value = ''; textarea.style.height = 'auto'; send(text); });
+    composer.addEventListener('submit', (event) => {
+      event.preventDefault();
+      if (askState.controller) return;
+      const text = textarea.value.trim() || (draftFiles.length ? 'Review the attached files.' : '');
+      if (!text) return;
+      textarea.value = '';
+      textarea.style.height = 'auto';
+      send(text, null, null, false, [...draftFiles]);
+    });
     stopBtn.addEventListener('click', async () => {
-      if (!askState.runId) return;
+      if (!askState.runId) { askState.controller?.abort(); return; }
       try { await api('/chat/runs/' + encodeURIComponent(askState.runId) + '/cancel', { method: 'POST' }); }
       catch (err) { toast(errorDetail(err).message, 'danger'); }
     });
     if (askState.runId) send('', null, askState.runId);
     textarea.focus();
-    return { teardown: () => { const subscriber = askState.controller; askState.controller = null; subscriber?.abort(); } }; // Detaches the viewer, not Ollama.
+    return { teardown: () => { const subscriber = askState.controller; askState.controller = null; subscriber?.abort(); } }; // Detaches the viewer, not llama.cpp.
   });
 
   // =====================================================================
@@ -450,7 +684,7 @@
   // =====================================================================
   route('personalize', async ({ view, inspector, setTitle, setInspectorTitle }) => {
     setTitle('Personalize'); setInspectorTitle('Import privacy');
-    $('#viewCrumb').textContent = 'Bring your existing AI history into PODA';
+    $('#viewCrumb').textContent = 'Memory and work preferences';
 
     const fileInput = el('input', { class: 'input', type: 'file', accept: '.zip,application/zip', 'aria-label': 'ChatGPT or Claude data export ZIP' });
     const profileToggle = el('input', { type: 'checkbox', checked: true });
@@ -530,6 +764,15 @@
       el('div', { class: 'grid-2' }, f('deadline', 'Deadline', 'date'), f('progress', 'Progress %', 'number', { min: 0, max: 100, value: 0 })),
       el('div', { class: 'field' }, el('label', { class: 'label', for: 'p-notes' }, 'Notes'), el('textarea', { class: 'input', name: 'notes', id: 'p-notes', rows: 2 })),
       el('div', { class: 'row' }, el('button', { class: 'btn btn-primary', type: 'submit' }, 'Add project')));
+    const modeInput = form.elements.mode;
+    const expiry = form.elements.ttl_minutes;
+    const syncGrantMode = () => {
+      expiry.closest('.field').hidden = modeInput.value !== 'temp';
+      form.elements.allow_execute.disabled = modeInput.value === 'read';
+      if (modeInput.value === 'read') form.elements.allow_execute.checked = false;
+    };
+    modeInput.addEventListener('change', syncGrantMode);
+    syncGrantMode();
     form.addEventListener('submit', async (e) => {
       e.preventDefault(); const fd = new FormData(form);
       try {
@@ -573,7 +816,7 @@
   // NOTION
   // =====================================================================
   route('notion', async ({ view, inspector, setTitle, setInspectorTitle }) => {
-    setTitle('Notion'); setInspectorTitle('Connection status'); $('#viewCrumb').textContent = 'Original database behind Notion Calendar';
+    setTitle('Calendar'); setInspectorTitle('Calendar details'); $('#viewCrumb').textContent = 'Synced with Notion';
     const statusHead = el('div', { class: 'stack-sm' });
     const stepsBar = el('div', { class: 'steps' });
     const tokenBox = el('div', { class: 'stack-sm' });
@@ -587,14 +830,20 @@
     const calDetail = el('div', { class: 'stack-sm' });
     inspector.append(statusHead, el('div', { class: 'divider' }), el('div', { class: 'stack-sm' }, el('h3', {}, 'Selected calendar entry'), calDetail));
     calDetail.appendChild(el('p', { class: 'faint small' }, 'Click an entry in the calendar to see its properties here.'));
+    const connection = el('details', { class: 'disclosure card', open: true },
+      el('summary', {}, 'Connect or manage Notion'),
+      el('div', { class: 'stack disclosure-body' },
+        el('p', { class: 'muted' }, 'In Notion, open the original database and share it with your PODA integration under Connections.'),
+        stepsBar,
+        el('div', { class: 'grid-2' }, section('1. Add an integration token', null, tokenBox),
+          section('2. Pick the calendar database', null, sourceBox)),
+        el('div', { class: 'grid-2' }, section('3. Check database fields', null, schemaBox),
+          section('4. Verify calendar changes', null, writeBox)),
+        section('Match your calendar fields', null, mapperBox, previewBox)));
+    const liveRows = el('details', { class: 'disclosure card dev-only', ontoggle: () => { if (liveRows.open) drawRows(); } },
+      el('summary', {}, 'Live Notion rows'), el('div', { class: 'disclosure-body' }, rowsBox));
     view.appendChild(el('div', { class: 'screen stack' },
-      el('div', { class: 'notice notice-accent' }, 'PODA connects to the original Notion database or data source, never to a linked view. Share the original source with the PODA connection from its page menu: ••• then Connections then Add connections. The token is stored in macOS Keychain and never shown again.'),
-      stepsBar,
-      section('Calendar', 'what Notion Calendar shows for this database · read-only', calendarBox),
-      el('div', { class: 'grid-2' }, section('1. Integration token', null, tokenBox), section('2. Choose the data source', null, sourceBox)),
-      el('div', { class: 'grid-2' }, section('3. Live schema', null, schemaBox), section('4. Write verification', null, writeBox)),
-      section('Schema mapper', 'versioned; preview before trusting', mapperBox, previewBox),
-      section('Live rows', 'read-only', rowsBox)));
+      section('Calendar', null, calendarBox), connection, liveRows));
 
     let status = null;
     function drawSteps(st) {
@@ -618,7 +867,9 @@
         kv([['Database', cap.database_title || cap.database_id], ['Data source', cap.data_source_name || cap.data_source_id], ['Read', yesNo(cap.can_read_content)], ['Insert', yesNo(cap.can_insert_content)], ['Update', yesNo(cap.can_update_content)], ['Mapping', yesNo(cap.mapping_active)], ['API version', cap.api_version], ['Last verified', fmtTime(status?.last_verified_at || status?.config?.last_verified_at)]]),
         el('div', { class: 'row' }, el('button', { class: 'btn btn-sm', onclick: () => refreshStatus(true) }, 'Verify now'), el('button', { class: 'btn btn-sm btn-danger', onclick: disconnect }, 'Disconnect')));
       drawSteps(status);
-      drawCalendar(); drawToken(); drawSource(); drawSchema(); drawWrite(); drawMapper(); drawRows();
+      drawCalendar(); drawToken(); drawSource(); drawSchema(); drawWrite(); drawMapper();
+      connection.open = !status?.capability?.connected;
+      if (liveRows.open) drawRows();
     }
     async function disconnect() {
       if (!(await confirmDialog({ title: 'Disconnect Notion?', body: 'The stored token is deleted from the operating system credential store and PODA loses all Notion capabilities immediately.', confirmLabel: 'Disconnect', danger: true }))) return;
@@ -643,6 +894,7 @@
       return { start: startOfWeek(first), end: addDays(startOfWeek(last), 6), label: c.toLocaleDateString(undefined, { month: 'long', year: 'numeric' }), month: c.getMonth() };
     }
     function showEvent(ev) {
+      showDetails(true);
       calDetail.innerHTML = '';
       const s = parseWhen(ev.start); const e = parseWhen(ev.end);
       const when = ev.all_day ? `${s.toLocaleDateString(undefined, { weekday: 'short', month: 'short', day: 'numeric' })}${e && dayKey(e) !== dayKey(s) ? ` → ${e.toLocaleDateString(undefined, { weekday: 'short', month: 'short', day: 'numeric' })}` : ''} · all day`
@@ -650,6 +902,7 @@
       calDetail.append(el('div', { class: 'row' }, el('strong', {}, ev.title), ev.type ? el('span', { class: `cal-type ${typeClass(ev.type)}` }, ev.type) : null),
         kv([['When', when], ['Status', ev.status], ['Commitment', ev.commitment], ['Area', (ev.area || []).join(', ')], ['Source', ev.source], ['Notes', ev.notes], ['Edited', fmtTime(ev.last_edited_time)]]),
         el('div', { class: 'row' }, ev.url ? el('a', { class: 'btn btn-sm', href: ev.url, target: '_blank', rel: 'noopener' }, 'Open in Notion') : null, ev.source_url ? el('a', { class: 'btn btn-sm btn-ghost', href: ev.source_url, target: '_blank', rel: 'noopener' }, 'Open source') : null));
+      calDetail.append(el('details', { class: 'dev-only disclosure' }, el('summary', {}, 'Raw calendar entry'), jsonBox(ev)));
       const options = (window.podaCalendarFields?.commitment_options || []);
       if (ev.page_id && options.length) {
         const selection = el('select', { class: 'input', 'aria-label': 'Commitment level' },
@@ -680,7 +933,15 @@
     function drawCalendar() {
       calendarBox.innerHTML = '';
       const cap = status?.capability || {};
-      if (!cap.connected) { calendarBox.appendChild(emptyState('Not connected', 'The calendar reads the connected data source’s date property once a source is connected.')); return; }
+      if (!cap.connected) {
+        calendarBox.appendChild(emptyState('Connect your calendar', 'Choose the Notion database that holds your events.',
+          el('button', { class: 'btn btn-primary', type: 'button', onclick: () => {
+            connection.open = true;
+            connection.scrollIntoView({ block: 'start' });
+            connection.querySelector('summary').focus({ preventScroll: true });
+          } }, 'Set up Notion')));
+        return;
+      }
       const range = calRange();
       const nav = el('div', { class: 'cal-nav' },
         el('div', { class: 'row' },
@@ -705,7 +966,9 @@
         }
         const todayKey = dayKey(new Date());
         const legendTypes = [...new Set(events.map((e) => e.type).filter(Boolean))];
-        const legend = el('div', { class: 'cal-legend row' }, el('span', { class: 'small faint' }, `${r.count} ${r.count === 1 ? 'entry' : 'entries'} · date property “${r.fields?.date}”${r.mapping_version ? ` · mapping v${r.mapping_version}` : ' · no mapping saved yet, using the obvious properties'} · shown in ${Intl.DateTimeFormat().resolvedOptions().timeZone}`),
+        const legend = el('div', { class: 'cal-legend row' },
+          el('span', { class: 'small muted' }, `${events.length} ${events.length === 1 ? 'entry' : 'entries'} · ${Intl.DateTimeFormat().resolvedOptions().timeZone}`),
+          el('span', { class: 'small faint dev-only' }, `Date field ${r.fields?.date || 'unknown'} · ${r.mapping_version ? 'mapping v' + r.mapping_version : 'inferred mapping'}`),
           ...legendTypes.map((t) => el('span', { class: `cal-type ${typeClass(t)}` }, t)));
         if (calState.view === 'month') {
           const grid = el('div', { class: 'cal-grid' }, ...['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'].map((d) => el('div', { class: 'cal-dow' }, d)));
@@ -880,7 +1143,7 @@
         const table = el('table', { class: 'table' }, el('thead', {}, el('tr', {}, ...['Title', 'Start', 'End', 'All day', 'Status', 'Type', 'Relations', 'External IDs'].map((h) => el('th', {}, h)))));
         const body = el('tbody');
         for (const p of pages) { const i = p.interpreted || {}; body.appendChild(el('tr', {}, el('td', {}, i.title || p.title), el('td', { class: 'mono' }, i.date_start || ''), el('td', { class: 'mono' }, i.date_end || ''), el('td', {}, i.all_day ? 'yes' : 'no'), el('td', {}, i.status || ''), el('td', {}, i.type || ''), el('td', { class: 'mono small' }, `${(i.project_ids || []).length} project · ${(i.class_ids || []).length} class`), el('td', { class: 'mono small' }, Object.entries(i.external_ids || {}).map(([k, v]) => `${k}=${v}`).join(' ')))); }
-        table.appendChild(body); return el('div', { class: 'stack-sm' }, el('p', { class: 'small muted' }, 'Read-only interpretation of real pages under the active mapping. Nothing is written.'), table);
+        table.appendChild(body); return el('div', { class: 'stack-sm' }, el('p', { class: 'small muted' }, 'Preview of the active mapping'), el('div', { class: 'table-scroll', tabindex: 0 }, table));
       });
     }
 
@@ -890,10 +1153,11 @@
       load(rowsBox, async () => {
         const r = await api('/notion/calendar/items?limit=50'); const items = r.results || [];
         if (!items.length) return emptyState('No pages returned', 'The data source may be empty or filtered.');
-        const table = el('table', { class: 'table' }, el('thead', {}, el('tr', {}, el('th', {}, 'Title'), el('th', {}, 'Properties'), el('th', {}, 'Edited'))));
-        const body = el('tbody');
-        for (const p of items.slice(0, 50)) { const props = Object.entries(p.properties || {}).filter(([, v]) => v !== null && v !== '' && !(Array.isArray(v) && !v.length)); body.appendChild(el('tr', {}, el('td', {}, el('a', { href: p.url || '#', target: '_blank', rel: 'noopener' }, p.title || 'Untitled')), el('td', {}, el('div', { class: 'row' }, ...props.slice(0, 6).map(([k, v]) => el('span', { class: 'chip' }, `${k} `, el('b', {}, typeof v === 'object' ? JSON.stringify(v).slice(0, 40) : String(v).slice(0, 40)))))), el('td', { class: 'small faint' }, fmtTime(p.last_edited_time)))); }
-        table.appendChild(body); return el('div', { class: 'stack-sm' }, el('p', { class: 'small faint' }, `${r.count ?? items.length} pages read through the data source query endpoint with pagination.`), table);
+        return el('div', { class: 'stack-sm' }, ...items.map(p =>
+          el('details', { class: 'disclosure' },
+            el('summary', {}, p.title || 'Untitled row'),
+            p.url ? el('a', { href: p.url, target: '_blank', rel: 'noopener' }, 'Open in Notion') : null,
+            jsonBox(p))));
       });
     }
     refreshStatus(false);
@@ -903,8 +1167,8 @@
   // FILES & AGENT
   // =====================================================================
   route('files', async ({ view, inspector, setTitle, setInspectorTitle }) => {
-    setTitle('Files & Agent'); setInspectorTitle('Grant model'); $('#viewCrumb').textContent = 'Scoped tools with receipts';
-    inspector.append(el('p', { class: 'small muted' }, 'PODA can only access the files and folders you grant. A file grant covers that file alone. Edit mode also creates and edits files with hash-validated patches and backups. Temporary grants expire automatically. Execution is a separate flag.'),
+    setTitle('Files & access'); setInspectorTitle('File access details'); $('#viewCrumb').textContent = 'Sandbox files and shared folders';
+    inspector.append(el('p', { class: 'small muted' }, 'PODA Sandbox has its own file access. External files and folders use grants. A file grant covers that file alone. Edit mode also creates and edits files with hash-validated patches and backups. Temporary grants expire automatically. Execution is a separate flag.'),
       el('p', { class: 'small faint' }, 'Revoking a grant removes the capability from the ledger immediately. Every write produces a receipt; a failed write never produces a success receipt.'));
     const grantsBox = el('div'); const toolsBox = el('div'); const receiptsBox = el('div'); const proposalsBox = el('div');
     const pathInput = el('input', { class: 'input', id: 'g-path', name: 'root_path', placeholder: '~/Desktop/PODA-sandbox', required: true });
@@ -922,24 +1186,68 @@
         window.podaDesktop ? el('div', { class: 'row' }, choose('file', 'Choose file…'), choose('directory', 'Choose folder…')) : null,
         el('div', { class: 'help' }, 'Choose an existing file or folder on the computer running PODA. A file grant does not include its parent folder.')),
       el('div', { class: 'grid-3 grant-grid' },
-        el('div', { class: 'field' }, el('label', { class: 'label', for: 'g-mode' }, 'Mode'), el('select', { class: 'input', id: 'g-mode', name: 'mode' }, el('option', { value: 'read' }, 'Read only'), el('option', { value: 'edit' }, 'Persistent edit'), el('option', { value: 'temp' }, 'One-task temporary edit'))),
+        el('div', { class: 'field' }, el('label', { class: 'label', for: 'g-mode' }, 'Mode'), el('select', { class: 'input', id: 'g-mode', name: 'mode' }, el('option', { value: 'read' }, 'Read only'), el('option', { value: 'edit' }, 'Persistent edit'), el('option', { value: 'temp' }, 'Temporary edit'))),
         el('div', { class: 'field' }, el('label', { class: 'label', for: 'g-label' }, 'Label'), el('input', { class: 'input', id: 'g-label', name: 'label', placeholder: 'optional' })),
-        el('div', { class: 'field' }, el('label', { class: 'label', for: 'g-ttl' }, 'Temp TTL (minutes)'), el('input', { class: 'input', id: 'g-ttl', name: 'ttl_minutes', type: 'number', min: 5, value: 60 }))),
+        el('div', { class: 'field' }, el('label', { class: 'label', for: 'g-ttl' }, 'Expires after (minutes)'), el('input', { class: 'input', id: 'g-ttl', name: 'ttl_minutes', type: 'number', min: 5, value: 60 }))),
       el('label', { class: 'check' }, el('input', { type: 'checkbox', name: 'allow_execute' }), 'Allow running Python inside this folder (edit or temp mode only)'),
       el('div', { class: 'row' }, el('button', { class: 'btn btn-primary', type: 'submit' }, 'Grant access')));
     form.addEventListener('submit', async (e) => {
       e.preventDefault(); const fd = new FormData(form);
-      try { await api('/agent/grants', { method: 'POST', body: { root_path: fd.get('root_path'), mode: fd.get('mode'), label: fd.get('label') || null, allow_execute: fd.get('allow_execute') === 'on', ttl_minutes: +fd.get('ttl_minutes') || null } }); form.reset(); toast('Access granted. Ledger updated.', 'ok'); refresh(); }
+      try { await api('/agent/grants', { method: 'POST', body: { root_path: fd.get('root_path'), mode: fd.get('mode'), label: fd.get('label') || null, allow_execute: fd.get('allow_execute') === 'on', ttl_minutes: +fd.get('ttl_minutes') || null } }); form.reset(); syncGrantMode(); toast('Access granted.', 'ok'); refresh(); }
       catch (err) { toast(errorDetail(err).message, 'danger'); }
     });
+    const sandboxBox = el('div');
+    const dataBox = el('div');
+    const upload = el('input', { type: 'file', class: 'input', 'aria-label': 'Import file into PODA Sandbox' });
+    const uploadButton = el('button', { class: 'btn btn-sm', type: 'button' }, 'Import a copy');
+    uploadButton.onclick = async () => {
+      const file = upload.files[0];
+      if (!file) return toast('Choose a file to import.', 'warn');
+      uploadButton.disabled = true;
+      try {
+        const body = new FormData(); body.append('file', file);
+        const response = await fetch('/agent/sandbox/upload', { method: 'POST', body });
+        const result = await response.json();
+        if (!response.ok) throw new ApiError(response.status, result.detail);
+        toast(`Imported ${result.filename} into PODA Sandbox.`, 'ok');
+        upload.value = '';
+        refreshSandbox();
+      } catch (err) { toast(errorDetail(err).message, 'danger'); }
+      finally { uploadButton.disabled = false; }
+    };
+    function refreshSandbox() {
+      return load(sandboxBox, async () => {
+        const { files } = await api('/agent/sandbox');
+        if (!files.length) return emptyState('No sandbox files', 'Ask PODA to create a file or import a copy to work on.');
+        return el('div', { class: 'stack-sm' }, ...files.map(file => el('div', { class: 'row-between' },
+          el('span', {}, file.filename, ' ', el('span', { class: 'faint small' }, fmtBytes(file.bytes))),
+          sandboxDownloadLink(file.filename))));
+      });
+    }
     view.appendChild(el('div', { class: 'screen stack' },
+      section('PODA Data', 'local memory and app files', dataBox),
+      section('PODA Sandbox', 'writable workspace · no grant required',
+        el('p', { class: 'small muted' }, 'Files created in chat are saved here. Import a copy of a file and ask PODA to revise it by name. Download a copy to your computer when you’re ready.'),
+        el('div', { class: 'row' }, upload, uploadButton), sandboxBox),
       el('div', { class: 'grid-main-side' }, section('File and path grants', 'scoped access to your files', grantsBox), section('Grant access', null, form)),
       el('div', { class: 'grid-2' }, section('Tool registry', 'what the agent can call', toolsBox), section('Pending proposals', 'awaiting your approval', proposalsBox)),
-      section('Action receipts', 'the only evidence of a completed side effect', receiptsBox),
-      softwarePanel()));
+      section('Action history', null, receiptsBox),
+      el('a', { class: 'btn text-link', href: '#/addons' }, 'Find program tools and skills in Add-ons')));
 
     async function refresh() {
       await Promise.all([
+        load(dataBox, async () => {
+          const data = await api('/system/storage');
+          const openFolder = el('button', { class: 'btn btn-sm', type: 'button', onclick: async () => {
+            try { await api('/system/storage/open', { method: 'POST' }); }
+            catch (err) { toast(errorDetail(err).message, 'danger'); }
+          } }, 'Open PODA Data Folder');
+          return el('div', { class: 'stack-sm' },
+            el('p', { class: 'small muted' }, 'PODA keeps chat history, memory, and settings in this local database. Updates reuse the same folder on this computer.'),
+            kv([['Data folder', data.data_directory], ['Memory database', data.database], ['Backups', data.backups]]),
+            el('div', { class: 'row' }, openFolder));
+        }),
+        refreshSandbox(),
         load(grantsBox, async () => {
           const r = await api('/agent/grants'); const grants = r.grants || [];
           if (!grants.length) return emptyState('No grants', 'Grant a specific file or folder to give PODA scoped access. Chat downloads are available without a grant.');
@@ -971,6 +1279,18 @@
   });
 
 
+  route('addons', ({ view, inspector, setTitle, setInspectorTitle }) => {
+    setTitle('Add-ons'); setInspectorTitle('Add-on details');
+    $('#viewCrumb').textContent = 'Program tools and skill instructions';
+    const skills = el('div', { id: 'saved-skills', class: 'stack' });
+    const refreshSkills = window.PODAPace.mountSkills(skills);
+    view.append(el('div', { class: 'screen stack' },
+      el('header', { class: 'page-intro' }, el('h2', {}, 'Add tools and skills'),
+        el('p', {}, 'Install a program tool to let PODA use an app, or save a skill to guide how it works.')),
+      softwarePanel(refreshSkills), skills));
+    inspector.append(el('p', { class: 'muted' }, 'Program tools run under your computer account. Each tool has a separate enable switch, and changes still require your approval.'));
+  });
+
   // ---------- Software skills (CLI-Anything) ----------
   function splitArgs(text) {
     const out = []; let cur = ''; let q = null;
@@ -983,13 +1303,46 @@
     if (cur) out.push(cur);
     return out;
   }
-  function softwarePanel() {
+  function softwarePanel(refreshSkills) {
     const catalogBox = el('div'); const detailBox = el('div'); const receiptsBox = el('div'); const sourcesBox = el('div');
+    const settings = el('div', { class: 'stack-sm' });
     const wrap = el('div', { class: 'stack' },
-      el('div', { class: 'grid-main-side' }, section('Software skills (CLI-Anything)', 'drive other programs through agent harnesses, with grants and receipts', catalogBox),
-        el('div', { class: 'stack' }, section('Selected harness', null, detailBox), section('Catalog sources', 'local checkouts of the CLI-Anything repo', sourcesBox))),
-      section('Software receipts', 'installs and runs', receiptsBox));
+      section('Program add-ons', null, settings),
+      el('div', { class: 'addon-grid' }, section('Catalog', null, catalogBox), section('Add-on details', null, detailBox)),
+      el('details', { class: 'card disclosure dev-only' }, el('summary', {}, 'Catalog sources and activity'),
+        el('div', { class: 'disclosure-body stack' }, sourcesBox, receiptsBox)));
     let selected = null;
+    let executionAllowed = false;
+    let filterText = '';
+    function drawSettings() {
+      const toggle = el('button', { class: 'btn', type: 'button', 'aria-pressed': String(executionAllowed) },
+        executionAllowed ? 'Turn off program add-ons' : 'Allow trusted program add-ons');
+      toggle.onclick = async () => {
+        const enable = !executionAllowed;
+        if (enable && !(await confirmDialog({ title: 'Allow trusted program add-ons?',
+          body: 'Program tools run as your computer user and can access what your account can access. Install and enable only tools you trust. PODA will still ask before running commands that make changes.', confirmLabel: 'Allow add-ons' }))) return;
+        toggle.disabled = true;
+        try {
+          const result = await api('/software/execution', { method: 'PUT', body: { enabled: enable, confirm: enable } });
+          executionAllowed = result.execution_allowed;
+          toast(executionAllowed ? 'Program add-ons allowed.' : 'Program add-ons turned off.', 'ok');
+          await refreshCatalog();
+          if (selected) await showDetail(selected);
+        } catch (err) { toast(errorDetail(err).message, 'danger'); }
+        finally { toggle.disabled = false; }
+      };
+      settings.replaceChildren(el('div', { class: 'row-between' },
+        el('p', { class: 'muted' }, executionAllowed ? 'You can install and enable individual program tools.' : 'Turn this on to install and use program tools. Skill instructions are always available.'), toggle));
+    }
+    async function downloadCatalog(button) {
+      button.disabled = true; button.textContent = 'Downloading catalog…';
+      try {
+        await api('/software/catalog/download', { method: 'POST', body: { confirm: true } });
+        toast('Add-on catalog downloaded.', 'ok');
+        await refreshCatalog();
+      } catch (err) { toast(errorDetail(err).message, 'danger'); }
+      finally { button.disabled = false; button.textContent = 'Get add-on catalog'; }
+    }
     const outcomePill = (o) => pill(o, o === 'succeeded' ? 'ok' : o === 'blocked' ? 'warn' : o === 'running' ? 'accent' : 'danger');
     async function runForm(name, h) {
       const input = el('input', { class: 'input mono', placeholder: '--help   or   info   or   project export --out out.svg' });
@@ -1014,17 +1367,42 @@
       selected = name; detailBox.innerHTML = ''; detailBox.appendChild(skeleton(4));
       try {
         const h = await api(`/software/${encodeURIComponent(name)}`);
+        if (selected !== name) return;
         detailBox.innerHTML = '';
         const toggles = el('div', { class: 'row' },
-          el('label', { class: 'check' }, el('input', { type: 'checkbox', checked: !!h.enabled, onchange: (e) => setGrant(name, e.target.checked, h.allow_mutating) }), 'Enabled'),
-          el('label', { class: 'check' }, el('input', { type: 'checkbox', checked: !!h.allow_mutating, onchange: (e) => setGrant(name, h.enabled || e.target.checked, e.target.checked) }), 'Allow mutating commands'));
+          el('label', { class: 'check' }, el('input', { type: 'checkbox', checked: !!h.enabled, disabled: !executionAllowed, onchange: (e) => setGrant(name, e.target.checked, h.allow_mutating) }), 'Use with PODA'),
+          el('label', { class: 'check' }, el('input', { type: 'checkbox', checked: !!h.allow_mutating, disabled: !executionAllowed, onchange: (e) => setGrant(name, h.enabled || e.target.checked, e.target.checked) }), 'Allow commands that make changes'));
         const actions = el('div', { class: 'row' });
-        if (!h.installed) actions.append(el('button', { class: 'btn btn-sm btn-primary', onclick: () => installHarness(h) }, h.local_harness ? 'Install (local checkout)' : 'Install (downloads)'));
-        else actions.append(el('button', { class: 'btn btn-sm btn-danger', onclick: () => uninstallHarness(h) }, 'Uninstall'));
+        if (!h.installed && h.install_cmd && ['pip', null].includes(h.package_manager || null)) {
+          actions.append(el('button', { class: 'btn btn-sm btn-primary', type: 'button',
+            onclick: (event) => installHarness(h, event.currentTarget) }, 'Install program tool'));
+        } else if (h.installed) {
+          actions.append(el('button', { class: 'btn btn-sm', type: 'button', onclick: () => uninstallHarness(h) }, 'Uninstall'));
+        } else {
+          actions.append(el('p', { class: 'small muted' }, 'Install this program tool from its publisher.'));
+        }
+        if (h.remote_skill || h.skill_path) {
+          const save = el('button', { class: 'btn btn-sm', type: 'button' }, 'Save skill instructions');
+          save.onclick = async () => {
+            save.disabled = true;
+            try {
+              await api('/software/' + encodeURIComponent(name) + '/save-skill', { method: 'POST', body: { confirm: true } });
+              toast('Skill saved. Turn it on under Saved skill instructions.', 'ok');
+              refreshSkills();
+              document.getElementById('saved-skills').scrollIntoView({ block: 'start' });
+            } catch (err) { toast(errorDetail(err).message, 'danger'); }
+            finally { save.disabled = false; }
+          };
+          actions.append(save);
+        }
         const skill = el('details', { class: 'skill-drawer' }, el('summary', {}, 'View skill (SKILL.md)'), el('pre', { class: 'json skill-md' }, h.skill_md || '(no SKILL.md available)'));
-        detailBox.append(el('div', { class: 'row' }, el('strong', {}, h.display_name || h.name), pill(h.installed ? 'installed' : 'not installed', h.installed ? 'ok' : 'warn'), ...(h.enabled ? [pill('enabled', 'accent')] : []), el('span', { class: 'chip' }, h.category || 'other')),
+        detailBox.append(el('div', { class: 'stack-sm' }, el('div', { class: 'row' }, el('strong', {}, h.display_name || h.name), pill(h.installed ? 'installed' : 'not installed', h.installed ? 'ok' : 'warn'), ...(h.enabled ? [pill('enabled', 'accent')] : []), el('span', { class: 'chip' }, h.category || 'other')),
           el('p', { class: 'small muted' }, h.description || ''), ...(h.requires ? [el('p', { class: 'small faint' }, 'Requires: ' + h.requires)] : []),
-          el('div', { class: 'small faint mono' }, h.executable || h.entry_point), toggles, actions, skill, h.installed ? await runForm(name, h) : el('p', { class: 'small faint' }, 'Install the harness to run it.'));
+          el('div', { class: 'small faint mono dev-only' }, h.executable || h.entry_point), actions,
+          h.installed ? toggles : null,
+          h.skill_md ? skill : null,
+          h.installed && h.enabled && executionAllowed ? el('details', { class: 'disclosure dev-only' },
+            el('summary', {}, 'Run a command'), await runForm(name, h)) : null));
       } catch (err) { detailBox.innerHTML = ''; detailBox.appendChild(errorNode(err)); }
     }
     async function setGrant(name, enabled, allowMutating) {
@@ -1032,34 +1410,53 @@
       catch (err) { toast(errorDetail(err).message, 'danger'); }
       refreshCatalog(); showDetail(name);
     }
-    async function installHarness(h) {
-      const remote = !h.local_harness;
-      const ok = await confirmDialog({ title: `Install ${h.display_name || h.name}?`, body: remote ? 'No local checkout exists: this downloads from GitHub/PyPI into PODA\'s separate software venv (logged in the egress audit).' : `Installs ${h.local_harness} into PODA's separate software venv (data/software-venv). Dependencies may be fetched from PyPI if not cached.`, confirmLabel: 'Install' });
-      if (!ok) return;
-      detailBox.appendChild(el('p', { class: 'small muted' }, 'Installing… (bounded output will appear here)'));
+    async function installHarness(h, button) {
+      if (!executionAllowed) {
+        toast('Allow trusted program add-ons above to install this tool.', 'warn');
+        settings.scrollIntoView({ block: 'center' });
+        return;
+      }
+      if (!(await confirmDialog({ title: 'Install ' + (h.display_name || h.name) + '?',
+        body: 'PODA may download this tool and its dependencies from GitHub and PyPI into a separate local environment.',
+        confirmLabel: 'Install' }))) return;
+      button.disabled = true; button.textContent = 'Installing…';
       try {
-        const r = await api(`/software/${encodeURIComponent(h.name)}/install`, { method: 'POST', body: { confirm: true, allow_network: remote } });
-        toast(r.ok ? `Installed ${h.name}` : `Install failed for ${h.name}`, r.ok ? 'ok' : 'danger');
-        detailBox.append(el('pre', { class: 'json' }, (r.output || '').slice(-4000)));
-      } catch (err) { toast(errorDetail(err).message, 'danger'); detailBox.appendChild(errorNode(err)); return; }
-      refreshCatalog(); showDetail(h.name); refreshReceipts();
+        const path = '/software/' + encodeURIComponent(h.name);
+        const result = await api(path + '/install', { method: 'POST', body: { confirm: true, allow_network: true } });
+        if (!result.ok) {
+          detailBox.append(el('div', { class: 'notice notice-danger', role: 'alert' }, 'Installation failed. Check the program requirements and try again.',
+            el('details', { class: 'dev-only' }, el('summary', {}, 'Install log'), el('pre', { class: 'json' }, (result.output || '').slice(-4000)))));
+          return;
+        }
+        toast('Installed ' + (h.display_name || h.name) + '. Switch on Use with PODA to enable it.', 'ok');
+        await refreshCatalog();
+        await showDetail(h.name);
+        refreshReceipts();
+      } catch (err) { detailBox.append(errorNode(err)); }
+      finally { button.disabled = false; button.textContent = 'Install program tool'; }
     }
     async function uninstallHarness(h) {
       if (!(await confirmDialog({ title: `Uninstall ${h.name}?`, body: 'Removes it from PODA\'s software venv.', confirmLabel: 'Uninstall', danger: true }))) return;
-      try { await api(`/software/${encodeURIComponent(h.name)}/uninstall`, { method: 'POST', body: { confirm: true } }); toast(`Uninstalled ${h.name}`, 'ok'); } catch (err) { toast(errorDetail(err).message, 'danger'); }
+      try { const r = await api(`/software/${encodeURIComponent(h.name)}/uninstall`, { method: 'POST', body: { confirm: true } }); if (r.ok) toast(`Uninstalled ${h.name}`, 'ok'); else toast('Uninstall did not finish.', 'danger'); } catch (err) { toast(errorDetail(err).message, 'danger'); }
       refreshCatalog(); showDetail(h.name); refreshReceipts();
     }
     async function refreshCatalog() {
       await load(catalogBox, async () => {
         const r = await api('/software');
         const all = Object.values(r.groups || {}).flat();
-        const head = el('div', { class: 'row' }, pill(`${r.count} in catalog`, 'accent'), pill(`${r.installed.length} installed`, r.installed.length ? 'ok' : 'warn'), pill(`${r.usable.length} usable`, r.usable.length ? 'ok' : 'warn'),
-          el('span', { class: 'small faint' }, r.capability?.detail || ''));
-        if (!all.length) return el('div', { class: 'stack-sm' }, head, emptyState('No harnesses found', 'Point the catalog at a CLI-Anything checkout below.'));
-        const filter = el('input', { class: 'input', placeholder: 'Filter by name, category, description…' });
+        executionAllowed = !!r.execution_allowed;
+        drawSettings();
+        const catalog = el('button', { class: 'btn btn-sm', type: 'button', onclick: (e) => downloadCatalog(e.currentTarget) }, 'Get add-on catalog');
+        const head = el('div', { class: 'row-between' },
+          el('span', { class: 'muted small' }, all.length ? all.length + ' available · ' + r.installed.length + ' installed' : 'Browse tools from CLI-Anything'),
+          catalog);
+        if (!all.length) return el('div', { class: 'stack-sm' }, head,
+          emptyState('No add-ons downloaded', 'Get the catalog to see which program tools and skills are available.'));
+        const filter = el('input', { class: 'input', value: filterText, placeholder: 'Search add-ons', 'aria-label': 'Search add-ons' });
         const list = el('div', { class: 'sw-list' });
         const render = () => {
-          const q = filter.value.trim().toLowerCase();
+          filterText = filter.value;
+          const q = filterText.trim().toLowerCase();
           list.innerHTML = '';
           all.filter((h) => !q || [h.name, h.display_name, h.category, h.description].join(' ').toLowerCase().includes(q)).slice(0, 120).forEach((h) => {
             list.appendChild(el('button', { class: 'sw-row' + (selected === h.name ? ' active' : ''), onclick: () => { showDetail(h.name); render(); } },
@@ -1090,7 +1487,7 @@
       });
     }
     refreshCatalog(); refreshReceipts(); refreshSources();
-    detailBox.appendChild(emptyState('Select a harness', 'Pick a program from the catalog to install, enable, read its skill, or run a command.'));
+    detailBox.appendChild(emptyState('Choose an add-on', 'Select a program to see what it does and how to use it.'));
     return wrap;
   }
 
@@ -1149,7 +1546,7 @@
       const before = el('input', { class: 'input', type: 'date', 'aria-label': 'Delete messages before' });
       retentionBox.append(el('div', { class: 'field' }, el('label', { class: 'label' }, 'Delete chat messages and their linked memories created before'), before, el('div', { class: 'help' }, 'Removes the source messages and the visible memory nodes that mirror them. Durable memories you committed by hand are kept.')),
         el('div', { class: 'row' },
-          el('button', { class: 'btn btn-danger', onclick: async () => { if (!before.value) return; if (!(await confirmDialog({ title: `Delete messages before ${before.value}?`, body: 'This cannot be undone except from a backup.', confirmLabel: 'Delete', danger: true }))) return; try { const r = await api('/privacy/retention', { method: 'POST', body: { delete_messages_before: before.value } }); toast(`Removed ${r.removed?.messages_and_linked_memories ?? 0} messages`, 'ok'); refresh(); } catch (err) { toast(errorDetail(err).message, 'danger'); } } }, 'Delete old messages'),
+          el('button', { class: 'btn btn-danger', onclick: async () => { if (!before.value) return toast('Choose a date first.', 'warn'); if (!(await confirmDialog({ title: `Delete messages before ${before.value}?`, body: 'This cannot be undone except from a backup.', confirmLabel: 'Delete', danger: true }))) return; try { const r = await api('/privacy/retention', { method: 'POST', body: { delete_messages_before: before.value } }); toast(`Removed ${r.removed?.messages_and_linked_memories ?? 0} messages`, 'ok'); refresh(); } catch (err) { toast(errorDetail(err).message, 'danger'); } } }, 'Delete old messages'),
           el('button', { class: 'btn', onclick: async () => { try { await api('/privacy/retention', { method: 'POST', body: { delete_egress_log: true } }); toast('Egress log cleared', 'ok'); refresh(); } catch (err) { toast(errorDetail(err).message, 'danger'); } } }, 'Clear network log')));
     }
     refresh();
@@ -1159,14 +1556,14 @@
   // SYSTEM
   // =====================================================================
   route('system', async ({ view, inspector, setTitle, setInspectorTitle }) => {
-    setTitle('System'); setInspectorTitle('Build'); $('#viewCrumb').textContent = 'Hardware, models, ledger';
+    setTitle('System'); setInspectorTitle('System details'); $('#viewCrumb').textContent = 'Models and this computer';
     const hwBox = el('div'); const modelsBox = el('div'); const benchBox = el('div'); const ledgerBox = el('div'); const managerBox = el('div');
-    view.appendChild(el('div', { class: 'screen stack' }, section('This Mac', 'probed at request time', hwBox), section('Model installer and profile selection', 'local Ollama', managerBox), section('Model profiles', 'selected only from installed models', modelsBox), section('Benchmarks', 'measured on this hardware', benchBox), section('Capability ledger', 'live and persisted', ledgerBox)));
-    try { const b = await api('/system/build'); const st = await api('/system/startup').catch(() => null); inspector.append(kv([['Version', b.version], ['Build ID', el('span', { class: 'mono' }, b.build_id)], ['Memory viewer', b.memory_viewer], ['Database', el('span', { class: 'mono small' }, b.db_path)], ['Port', b.port]]), st ? el('details', { class: 'thought-panel' }, el('summary', {}, 'Startup report'), el('pre', {}, JSON.stringify(st, null, 2))) : null); } catch (err) { inspector.appendChild(errorNode(err)); }
+    view.appendChild(el('div', { class: 'screen stack' }, section('This computer', null, hwBox), section('Model installer and profile selection', 'local llama.cpp', managerBox), section('Model profiles', 'selected only from installed models', modelsBox), section('Benchmarks', 'measured on this hardware', benchBox), section('Capability ledger', 'live and persisted', ledgerBox)));
+    try { const b = await api('/system/build'); const st = await api('/system/startup').catch(() => null); inspector.append(kv([['Version', b.version], ['Build ID', el('span', { class: 'mono' }, b.build_id)], ['Memory viewer', b.memory_viewer], ['Database', el('span', { class: 'mono small' }, b.db_path)], ['Port', b.port]]), st ? el('details', { class: 'thought-panel dev-only' }, el('summary', {}, 'Startup report'), el('pre', {}, JSON.stringify(st, null, 2))) : null); } catch (err) { inspector.appendChild(errorNode(err)); }
     load(hwBox, async () => {
       const h = await api('/system/hardware');
-      return el('div', { class: 'stack-sm' }, el('div', { class: 'stats' }, ...[[h.chip || 'unknown', 'chip'], [`${h.unified_memory_gb ?? h.ram_total_gb} GB`, h.unified_memory_gb == null ? 'physical RAM' : 'unified memory'], [h.gpu_memory_dedicated_gb==null ? 'shared / unavailable' : h.gpu_memory_dedicated_gb+' GB','dedicated VRAM'], [`${h.disk_free_gb} GB`, 'disk free'], [h.gpu || h.metal || 'unavailable', 'graphics'], [h.ollama?.version || (h.ollama?.reachable ? 'reachable' : 'unreachable'), 'ollama']].map(([v, k]) => el('div', { class: 'stat' }, el('span', { class: 'v' }, v), el('span', { class: 'k' }, k)))),
-        (h.ollama_resident || []).length ? el('div', { class: 'row' }, el('span', { class: 'faint small' }, 'Resident now:'), ...h.ollama_resident.map((m) => el('span', { class: 'chip' }, `${m.name} `, el('b', {}, `${fmtBytes(m.size_vram || m.size)} · ctx ${m.context_length || '?'}`)))) : el('p', { class: 'faint small' }, 'No model is resident in memory right now.'));
+      return el('div', { class: 'stack-sm' }, el('div', { class: 'stats' }, ...[[h.chip || 'unknown', 'chip'], [`${h.unified_memory_gb ?? h.ram_total_gb} GB`, h.unified_memory_gb == null ? 'physical RAM' : 'unified memory'], [h.gpu_memory_dedicated_gb==null ? 'shared / unavailable' : h.gpu_memory_dedicated_gb+' GB','dedicated VRAM'], [`${h.disk_free_gb} GB`, 'disk free'], [h.gpu || h.metal || 'unavailable', 'graphics'], [h.inference?.version || (h.inference?.reachable ? 'reachable' : 'unreachable'), 'llama.cpp']].map(([v, k]) => el('div', { class: 'stat' }, el('span', { class: 'v' }, v), el('span', { class: 'k' }, k)))),
+        (h.inference_resident || []).length ? el('div', { class: 'row' }, el('span', { class: 'faint small' }, 'Resident now:'), ...h.inference_resident.map((m) => el('span', { class: 'chip' }, `${m.name} `, el('b', {}, `ctx ${m.context_length || '?'} · ${m.speculation || 'none'}`)))) : el('p', { class: 'faint small' }, 'No model is resident in memory right now.'));
     });
     async function drawModels() {
       await load(modelsBox, async () => {
@@ -1177,13 +1574,13 @@
         return el('div', { class: 'stack' }, el('div', { class: 'row' },
           el('span', { class: 'chip' }, 'installed ', el('b', {}, (m.installed || []).join(', ') || 'none')),
           el('span', { class: 'chip' }, 'embedding ', el('b', {}, m.embedding+' '+(m.embedding_installed?'':'(missing)'))),
-          el('span', { class: 'small muted' }, 'Compare all local model families and their quantizations above.')),profiles);
+          el('span', { class: 'small muted' }, 'Choose model roles and GGUF quantizations above.')), el('div', { class: 'table-scroll', tabindex: 0 }, profiles));
       });
     }
     async function drawBench() {
       await load(benchBox, async () => {
         const m = await api('/system/models'); const rows = m.benchmarks || [];
-        if (!rows.length) return emptyState('No benchmarks recorded', 'Run one from the model profiles above. Each run measures load, first token, tokens per second, and resident memory.');
+        if (!rows.length) return emptyState('No benchmarks recorded', 'Run one from the model profiles above. Each run measures model readiness, first token, and tokens per second.');
         const table = el('table', { class: 'table' }, el('thead', {}, el('tr', {}, ...['Model', 'Context', 'Load', 'First token', 'Gen tok/s', 'Prompt tok/s', 'Memory', 'When'].map((h) => el('th', {}, h)))));
         table.appendChild(el('tbody', {}, ...rows.slice(0, 30).map((b) => el('tr', {}, el('td', { class: 'mono' }, b.model), el('td', { class: 'num' }, `${(b.num_ctx / 1024).toFixed(0)}K`), el('td', { class: 'num' }, `${b.load_s}s`), el('td', { class: 'num' }, `${b.first_token_s}s`), el('td', { class: 'num' }, b.gen_tok_s ?? ''), el('td', { class: 'num' }, b.prompt_tok_s ?? ''), el('td', { class: 'num' }, fmtBytes(b.memory_bytes)), el('td', { class: 'small faint' }, fmtTime(b.created_at))))));
         return table;
@@ -1191,12 +1588,14 @@
     }
     async function bench(model, num_ctx) {
       const t = toast(`Benchmarking ${model} at ${num_ctx / 1024}K context…`, '', 60000);
-      try { const r = await api('/system/benchmark', { method: 'POST', body: { model, num_ctx } }); t.remove(); toast(`${model}: ${r.gen_tok_s} tok/s, first token ${r.first_token_s}s, ${fmtBytes(r.memory_bytes)}`, 'ok', 8000); drawBench(); }
+      try { const r = await api('/system/benchmark', { method: 'POST', body: { model, num_ctx } }); t.remove(); const accepted = r.speculative_tokens?.accepted_tokens;
+        const draft = accepted == null ? '' : ` · ${accepted} draft tokens accepted`;
+        toast(`${model} · ${r.gen_tok_s ?? 'unknown'} tok/s · first token ${r.first_token_s ?? 'unknown'}s · ${r.speculation || 'none'}${draft}`, 'ok', 8000); drawBench(); }
       catch (err) { t.remove(); toast(errorDetail(err).message, 'danger'); }
     }
     if (window.PODAModelManager?.mount) window.PODAModelManager.mount(managerBox);
     drawModels(); drawBench();
-    load(ledgerBox, async () => { const l = await api('/capabilities/ledger'); return el('div', { class: 'stack-sm' }, el('div', { class: 'row' }, pill(`Ollama ${l.current?.ollama?.reachable ? 'reachable' : 'unreachable'}`, l.current?.ollama?.reachable ? 'ok' : 'danger'), statusPill(l.current?.notion?.status), pill(`${(l.current?.filesystem?.granted_roots || []).length} path grants`, 'accent'), pill(l.current?.memory?.encrypted_at_rest ? 'encrypted at rest' : 'not encrypted', l.current?.memory?.encrypted_at_rest ? 'ok' : 'danger')), jsonBox(l.current)); });
+    load(ledgerBox, async () => { const l = await api('/capabilities/ledger'); return el('div', { class: 'stack-sm' }, el('div', { class: 'row' }, pill(`llama.cpp ${l.current?.inference?.reachable ? 'reachable' : 'unreachable'}`, l.current?.inference?.reachable ? 'ok' : 'danger'), statusPill(l.current?.notion?.status), pill(`${(l.current?.filesystem?.granted_roots || []).length} path grants`, 'accent'), pill(l.current?.memory?.encrypted_at_rest ? 'encrypted at rest' : 'not encrypted', l.current?.memory?.encrypted_at_rest ? 'ok' : 'danger')), jsonBox(l.current)); });
   });
 
   // ---------- Boot ----------

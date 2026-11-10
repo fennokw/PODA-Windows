@@ -13,6 +13,15 @@ from pathlib import Path
 BACKEND = Path(os.environ.get("PODA_TEST_BACKEND", Path(__file__).parent / ".backend")).resolve()
 
 
+def test_packaged_llama_cpp_runs():
+    name = "llama-server.exe" if sys.platform == "win32" else "llama-server"
+    binary = next((BACKEND / "llama-runtime").rglob(name))
+    version = subprocess.run([str(binary), "--version"], cwd=binary.parent, check=True,
+                             capture_output=True, text=True, timeout=15)
+    assert "12247" in version.stdout + version.stderr
+
+
+
 def test_desktop_requires_token_and_local_session(tmp_path):
     assert not (BACKEND / "poda_app" / "server.py").exists()
     assert (BACKEND / "poda_app" / "main.py").is_file()
@@ -57,3 +66,60 @@ def test_desktop_requires_token_and_local_session(tmp_path):
             except subprocess.TimeoutExpired:
                 child.kill()
                 child.wait(timeout=3)
+
+
+def test_relaunch_waits_for_profile_and_keeps_grant(tmp_path):
+    from contextlib import ExitStack
+
+    env = dict(os.environ, PODA_DATA_DIR=str(tmp_path / "profile"), PODA_DB_ENCRYPTION="off",
+               PODA_DESKTOP_TOKEN="synthetic-local-token")
+    folder = tmp_path / "example-grant"
+    folder.mkdir()
+
+    with ExitStack() as cleanup:
+        def start(label):
+            logfile = tmp_path / f"{label}.log"
+            with logfile.open("w", encoding="utf-8") as log:
+                child = subprocess.Popen([sys.executable, str(BACKEND / "desktop_backend.py")], env=env,
+                                         stdin=subprocess.PIPE, stdout=log, stderr=log)
+
+            def stop():
+                if child.poll() is None:
+                    child.kill()
+                child.wait(timeout=5)
+            cleanup.callback(stop)
+            return child, logfile
+
+        def connect(child, logfile):
+            deadline = time.monotonic() + 30
+            while child.poll() is None and time.monotonic() < deadline:
+                handshake = next((line for line in logfile.read_text(encoding="utf-8", errors="replace").splitlines()
+                                  if line.startswith("PODA_DESKTOP ")), None)
+                if handshake:
+                    port = json.loads(handshake.removeprefix("PODA_DESKTOP "))["port"]
+                    http = httpx.Client(base_url=f"http://127.0.0.1:{port}", trust_env=False, timeout=1,
+                                        headers={"X-PODA-Desktop": env["PODA_DESKTOP_TOKEN"]})
+                    cleanup.callback(http.close)
+                    try:
+                        if http.get("/").status_code == 200:
+                            return http
+                    except httpx.RequestError:
+                        pass
+                    http.close()
+                time.sleep(0.05)
+            pytest.fail(logfile.read_text(encoding="utf-8", errors="replace"))
+
+        first, first_log = start("first")
+        http = connect(first, first_log)
+        grant = http.post("/agent/grants", json={"root_path": str(folder), "mode": "read"}, timeout=25)
+        assert grant.status_code == 200, grant.text
+        second, second_log = start("second")
+        time.sleep(2)
+        assert second.poll() is None
+        assert "PODA_DESKTOP " not in second_log.read_text(encoding="utf-8", errors="replace")
+        first.stdin.close()
+        assert first.wait(timeout=15) == 0
+        http = connect(second, second_log)
+        assert any(item["root_path"] == str(folder.resolve()) for item in http.get("/agent/grants").json()["grants"])
+        second.stdin.close()
+        assert second.wait(timeout=15) == 0

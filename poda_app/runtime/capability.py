@@ -4,7 +4,7 @@ from __future__ import annotations
 import json
 from typing import Any
 
-from . import config, ollama
+from . import config, inference
 from .db import connect, now_iso, rows, one, encryption_status
 from ..agent.grants import filesystem_capability
 from ..connectors.notion import state as notion_state
@@ -12,9 +12,9 @@ from ..connectors.email import state as email_state
 
 
 def manifest() -> dict[str, Any]:
-    ollama_state = ollama.status()
+    engine_state = inference.status()
     from . import models
-    selected_profiles = models.registry(ollama_state.get("models") or []).get("profiles", {})
+    selected_profiles = models.registry(engine_state.get("models") or []).get("profiles", {})
     conn = connect()
     try:
         integrations = {r["integration"]: r for r in rows(conn, "SELECT * FROM integration_state")}
@@ -38,7 +38,7 @@ def manifest() -> dict[str, Any]:
         "network_workers": False,
         "internet_browsing": False,
         "cloud_models": False,
-        "ollama": ollama_state,
+        "inference": engine_state,
         "selected_model_profiles": {name: item.get("model") for name,item in selected_profiles.items()},
         "daily_updates": {"configured_locally": True, "runs_while_app_is_open": True, "cloud_scheduler": False},
         "code": {
@@ -66,7 +66,7 @@ def manifest() -> dict[str, Any]:
                 if notion["connected"] else integrations.get("calendar", {}).get("detail", "No calendar connection.")
             ),
         },
-        "filesystem": {**fs, "managed_internal_paths": [str(config.DATA_DIR), str(config.STATIC_DIR)]},
+        "filesystem": {**fs, "poda_sandbox": {"can_read": True, "can_create": True, "can_edit": True}, "managed_internal_paths": [str(config.DATA_DIR), str(config.STATIC_DIR)]},
         "memory": {
             "enabled": True,
             "storage": "local SQLite (SQLCipher encrypted)" if enc.get("database_encrypted_on_disk") else "local SQLite (NOT encrypted at rest)",
@@ -102,12 +102,12 @@ def sync_ledger(snapshot: dict[str, Any] | None = None) -> dict[str, Any]:
 
 def ledger_context(cap: dict[str, Any]) -> str:
     """Concise system-state memory injected into every normal model request."""
-    models = cap.get("ollama", {}).get("models") or []
+    models = cap.get("inference", {}).get("models") or []
     fs = cap.get("filesystem", {})
     notion = cap.get("notion", {})
     roots = fs.get("granted_roots") or []
     fs_line = ("Filesystem: granted paths → " + "; ".join(f"{r['path']} [{r['mode']}{', exec' if r.get('allow_execute') else ''}]" for r in roots) +
-               ". Anything outside these paths is NOT accessible.") if roots else "Filesystem: user files require a grant. Chat downloads work without one."
+               ". External file access is limited to these grants.") if roots else "Filesystem: external user files require a grant."
     code_line = ("Code: CAN generate code; CAN run Python inside granted folders that allow execution." if cap.get("code", {}).get("can_execute_user_code")
                  else "Code: CAN generate code text in chat; CANNOT execute code or run shell commands.")
     notion_line = (f"Notion: {notion.get('status')} to '{notion.get('database_title') or notion.get('database_id')}' (workspace {notion.get('workspace_name') or 'unknown'}); "
@@ -123,8 +123,9 @@ def ledger_context(cap: dict[str, Any]) -> str:
         email_line = "Mail: NOT CONNECTED. Connect a supported account in the Mail screen. Legacy arbitrary-host IMAP preview is retired."
     lines = [
         f"Verified at: {cap.get('verified_at')} (build {cap.get('build_id')})",
-        f"Ollama reachable: {bool(cap.get('ollama', {}).get('reachable'))}; installed models: {', '.join(models[:8]) or 'none'}",
+        f"llama.cpp reachable: {bool(cap.get('inference', {}).get('reachable'))}; installed models: {', '.join(models[:8]) or 'none'}",
         code_line, fs_line,
+        "PODA Sandbox: app-owned workspace with read, create and edit access. Users can download its files without a folder grant.",
         email_line,
         notion_line,
         f"Memory: local second brain, {cap.get('memory', {}).get('memory_nodes', 0)} memory nodes; encrypted at rest: {cap.get('memory', {}).get('encrypted_at_rest')}.",

@@ -10,7 +10,7 @@ import json
 import re
 from datetime import date, datetime, timedelta
 from typing import Any
-from ..runtime import config, ollama
+from ..runtime import inference, models
 
 from ..agent import tools
 from ..runtime.db import connect, rows
@@ -64,13 +64,15 @@ def _keywords(message: str) -> list[str]:
 def _local_semantic_terms(message: str) -> list[str]:
     """Optional local-only expansion with strict output bounds."""
     try:
+        model = models.registry()["profiles"]["fast"]["model"]
+        if not model:
+            return []
         prompt = ("Suggest 5 related concepts/synonyms that could appear in emails about "
                   "this search. Return ONLY a JSON array of short strings (1-3 words each), "
                   "without instructions, URLs or commentary:\n" + message[:700])
-        answer = ollama.chat([{"role":"system","content":"Return a JSON array only."},
+        answer = inference.chat([{"role":"system","content":"Return a JSON array only."},
                               {"role":"user","content":prompt}],
-                             config.FAST_MODEL,
-                             options={"temperature":0.0,"num_predict":130,"num_ctx":2048})
+                             model, options={"temperature":0.0,"num_predict":130,"num_ctx":2048}, think=False)
         raw = (answer.get("message") or {}).get("content") or ""
         match = re.search(r"\[[\s\S]*?\]", raw)
         terms = json.loads(match.group(0)) if match else []
@@ -80,7 +82,7 @@ def _local_semantic_terms(message: str) -> list[str]:
                 if isinstance(term, str) and 2 <= len(term.strip()) <= 40
                 and not re.search(r"[/<>]", term)]
     except Exception:
-        return []  # Ollama downtime must not break mail searching.
+        return []  # llama.cpp downtime must not break mail searching.
 
 
 def _previous_search(session_id: str | None) -> dict[str, Any]:
@@ -123,7 +125,9 @@ def _date_span(message: str, now: datetime) -> tuple[str | None, str | None]:
         return (today - timedelta(days=7)).isoformat(), today.isoformat()
     if any(k in q for k in ("past month", "last month", "last 30 days")):
         return (today - timedelta(days=30)).isoformat(), today.isoformat()
-    if any(k in q for k in ("yesterday",)):
+    if "since yesterday" in q or re.search(r"\b(?:past|last) (?:day|24 hours)\b", q):
+        return (today - timedelta(days=1)).isoformat(), today.isoformat()
+    if "yesterday" in q:
         v = today - timedelta(days=1)
         return v.isoformat(), v.isoformat()
     if "today" in q:
@@ -193,6 +197,8 @@ def report(params: dict[str, Any], outcome: dict[str, Any]) -> str:
     scored.sort(key=lambda v: (v[0], v[2].get("date") or ""), reverse=True)
     important = [(score, labels, row) for score, labels, row in scored if score >= 3]
     period = (f"{params['start_date']} through {params['end_date']}" if params.get("start_date") and params.get("end_date") else "the searched mailboxes")
+    if params.get("display_since"):
+        period = f"since {params['display_since']}"
     lines = [f"**Email review: {period}**"]
     lines.append(f"Search completed. I examined {data.get('scanned_headers', 0)} message headers and "
                  f"{data.get('read_bodies', 0)} message bodies; {len(messages)} candidate messages were returned.")
@@ -223,12 +229,17 @@ def report(params: dict[str, Any], outcome: dict[str, Any]) -> str:
     return "\n\n".join(lines)
 
 
-def fulfill(message: str, session_id: str | None, account_id: str | None = None) -> tuple[dict[str, Any], dict[str, Any], str]:
-    params = parameters(message, session_id)
+def fulfill(message: str, session_id: str | None, account_id: str | None = None, *,
+            now: datetime | None = None, date_first: bool = False) -> tuple[dict[str, Any], dict[str, Any], str]:
+    params = parameters(message, session_id, now)
+    if date_first:
+        params.update(query="", related_terms=[])
+        if now and getattr(now.tzinfo, "key", None):
+            params["date_timezone"] = now.tzinfo.key
     if account_id:
         params["account_id"] = account_id
     if params.get("query") and not FOLLOWUP.search(message):
-        # Only local Ollama sees the user query; no third-party inference.
+        # Only local llama.cpp sees the user query; no third-party inference.
         params["related_terms"] = list(dict.fromkeys([
             *(params.get("related_terms") or []), *_local_semantic_terms(message)]))[:7]
     outcome = tools.execute("mail_search", params, approved=False, session_id=session_id)

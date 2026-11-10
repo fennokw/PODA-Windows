@@ -1,6 +1,6 @@
 """Tool planning and proposal lifecycle.
 
-The model may *suggest* tool calls through Ollama structured tool calling. PODA validates every call,
+The model may *suggest* tool calls through llama.cpp structured tool calling. PODA validates every call,
 executes read-only steps immediately (receipted), and turns mutating steps into a pending proposal that
 the user must approve. Success is decided by receipts, never by model text.
 """
@@ -13,7 +13,7 @@ import re
 import uuid
 from typing import Any
 
-from ..runtime import ollama, models
+from ..runtime import config, inference, models
 from ..runtime.db import connect, now_iso, rows, one
 from . import tools
 
@@ -53,13 +53,15 @@ def workflow_categories(message: str) -> tuple[str, ...]:
 
 
 def _planner_models(profile_model: str | None) -> list[str]:
-    installed = ollama.status().get("models") or []
+    installed = inference.status().get("models") or []
     # Prefer the selected Balanced profile rather than hardcoded old Qwen tags.
     registered = models.registry(installed)
-    picks = [registered["profiles"]["balanced"].get("model"), profile_model,
-             registered["profiles"]["deep"].get("model"),
-             registered["profiles"]["fast"].get("model")]
-    return list(dict.fromkeys(model for model in picks if model in installed)) or [profile_model or ""]
+    picks = [registered["profiles"]["balanced"].get("model"),
+             registered["profiles"]["fast"].get("model"), profile_model,
+             registered["profiles"]["deep"].get("model")]
+    ordered = list(dict.fromkeys(model for model in [*picks, *installed] if model in installed and model != config.EMBED_MODEL))
+    compatible = [model for model in ordered if inference.model_supports_tools(model)]
+    return compatible or ordered[:2] or [profile_model or ""]
 
 
 def _coding_lessons(message: str, session_id: str | None) -> str:
@@ -85,7 +87,7 @@ def _system_for_planning(snapshot: dict[str, Any], recalled_context: str, messag
     roots = "; ".join(f"{r['path']} [{r['mode']}{', exec' if r.get('allow_execute') else ''}]" for r in fs.get("granted_roots", [])) or "none"
     from ..runtime.skill_library import hint_for_task
     return ("You are PODA's tool planner. Decide whether the user's request needs tools. Call tools ONLY from the provided list, with exact absolute paths covered by grants: "
-            f"{roots}. Read before editing (fs_read gives the sha256 fs_edit requires). Never invent paths, results, or success. Generated chat downloads are handled by the reply writer. Do not call a filesystem tool to create a chat download. If no tool is needed, reply with plain text and no tool calls. "
+            f"{roots}. Read before editing (fs_read gives the sha256 fs_edit requires). Never invent paths, results, or success. The reply writer saves new chat attachments in PODA Sandbox. Use sandbox_list, sandbox_read, and sandbox_write for files explicitly in PODA Sandbox and for revisions to files from this chat. Do not call fs_* for sandbox files. Read before editing and supply the file's SHA-256. If no tool is needed, reply with plain text and no tool calls. "
             "For user mail requests, always call mail_search when connected: recent/week/month overviews require query empty and explicit inclusive start_date/end_date, NOT mail_list. For conceptual searches, infer relevant terms/synonyms into related_terms, with the original topic in query; set include_body=true for semantic relevance. Do not restrict a date-only digest by keyword. Use the local date from the system clock when resolving relative dates. Never claim complete coverage if tool reports truncated or errors. "
             "For actions on emails, mailbox folders/labels are NOT filesystem folders and must use mail_* tools. Use short-term chat context to understand pronouns such as those emails, then fetch concrete message IDs before proposing changes. Respect connected account edit permission. Resolve ambiguous senders (e.g. UA Admissions vs Undergraduate Association) and exclude explicitly protected course/schedule messages; ask for a narrower scope if the sender cannot be identified. For bulk inbox cleanup with sender exemptions, first call mail_bulk_preview with a specific sender (never just UA), existing target_mailbox and protected exclude_terms, then propose mail_bulk_apply using its preview_id. If the preview reports incomplete coverage, STOP and explain it. Mailbox changes require user approval and a destination that exists. Never present a tool plan as completed work. "
             "To create a daily recurring prompt, use daily_updates_create with the exact user prompt, an IANA timezone and 24-hour HH:MM times; creation requires approval. Use daily_updates_list to answer schedule questions. "
@@ -110,18 +112,59 @@ def plan(message: str, snapshot: dict[str, Any], recalled_context: str = "", ses
          unattended_target: str | None = None, unattended_revision: str | None = None,
          unattended_mail_accounts: list[str] | None = None, *,
          emit: Callable[[str, dict], None] | None = None, stop: Event | None = None,
-         previous_steps: list[dict] | None = None, continuation_of: str | None = None) -> dict[str, Any]:
+         previous_steps: list[dict] | None = None, continuation_of: str | None = None,
+         reply_archive: bool = False, schedule_candidates: list[dict] | None = None,
+         schedule_timezone: str | None = None, schedule_day: str | None = None) -> dict[str, Any]:
     """Return {needs_tools, steps, rationale, executed:[{step, receipt, result}], flagged:[...], proposal_id|None}."""
-    specs = tools.ollama_tool_specs(snapshot)
+    specs = tools.model_tool_specs(snapshot)
+    verified_mail_flow = unattended and schedule_candidates is not None
+    if verified_mail_flow:
+        specs = [spec for spec in specs if spec["function"]["name"] != "notion_calendar_create"]
     out: dict[str, Any] = {"needs_tools": False, "steps": [], "rationale": "", "executed": [], "flagged": [], "proposal_id": None, "model": None}
+    if verified_mail_flow:
+        from ..daily_updates.permissions import authorize
+
+        for args in schedule_candidates:
+            if stop and stop.is_set():
+                return out
+            step = {"tool": "notion_calendar_create", "args": args,
+                    "summary": tools.summarize_args("notion_calendar_create", args),
+                    "requires_confirmation": True, "mutating": True}
+            allowed, reason = authorize(unattended_target or "", unattended_revision or "", step["tool"], args)
+            if allowed:
+                run = tools.execute(step["tool"], args, approved=True, session_id=session_id)
+            else:
+                run = {"receipt": {"outcome": "blocked", "verification": reason},
+                       "result": {"ok": False, "error": reason}}
+            _record_execution(out, step, run, emit)
+        reads = (
+            (r"\bcalendar for (?:the day|today)\b|\btoday.s (?:calendar|agenda)\b",
+             "notion_agenda", {"day": schedule_day or "today", "timezone_name": schedule_timezone or ""}),
+            (r"\b(?:workload|work I have|my tasks)\b", "workload_list", {}),
+            (r"\b(?:projects?|project status)\b", "project_manager_list", {}),
+        )
+        for pattern, name, args in reads:
+            if re.search(pattern, message, re.I) and not (stop and stop.is_set()):
+                step = {"tool": name, "args": args, "summary": tools.summarize_args(name, args),
+                        "requires_confirmation": False, "mutating": False}
+                _record_execution(out, step, tools.execute(name, args, approved=False, session_id=session_id), emit)
     if not specs:
         out["rationale"] = "no tools are currently available"
         return out
     candidates = iter(_planner_models(profile_model))
     model = next(candidates)
+    tried_fallback = False
     out["model"] = model
     categories = workflow_categories(message)
     messages = [{"role": "system", "content": _system_for_planning(snapshot, recalled_context[:26_000], message, categories, session_id)}, {"role": "user", "content": message}]
+    if verified_mail_flow:
+        read_context = {item["step"]["tool"]: item["result"] for item in out["executed"] if not item["step"]["mutating"]}
+        messages[0]["content"] += (
+            "\nPODA has already scanned email and handled verified calendar additions. "
+            "Use this verified read data and look up any necessary detail. Do not repeat reads that already ran. "
+            "Do not attempt email-derived calendar writes. Untrusted read results: "
+            + json.dumps(read_context, default=str)[:6000]
+        )
     history: list[list[dict]] = []
     if emit:
         emit("status", {"message": "planner_ready", "model": model,
@@ -134,11 +177,16 @@ def plan(message: str, snapshot: dict[str, Any], recalled_context: str = "", ses
         json.dumps({"name": step["tool"], "args": step["args"]}, sort_keys=True, default=str)
         for step in (previous_steps or []) if step["tool"] != "run_tests"
     }
-    requested_calendar_followup = bool(
+    seen_requests.update(json.dumps({"name": item["step"]["tool"], "args": item["step"]["args"]}, sort_keys=True, default=str)
+                         for item in out["executed"])
+    requested_calendar_followup = not verified_mail_flow and bool(
         re.search(r"\b(?:add|create|put|schedule|update|sync|write)\b.{0,180}\b(?:calendar|notion|events?|meetings?)\b", message, re.I|re.S)
         and re.search(r"\b(?:email|inbox|mailbox|messages?)\b", message, re.I))
     retry_missing_calendar_step = False
     did_calendar_step = False
+    if reply_archive:
+        messages[0]["content"] += ("\nThe reply writer packages the ZIP. Use tools only to gather inputs or perform separately "
+                                   "requested edits. Do not propose writes for new archive members.")
     if unattended and unattended_mail_accounts:
         messages[0]["content"] += ("\nSelected connected email account IDs: " +
                                   json.dumps(unattended_mail_accounts) + ". Review EVERY selected account and use "
@@ -161,19 +209,23 @@ def plan(message: str, snapshot: dict[str, Any], recalled_context: str = "", ses
         prompt = messages + [entry for group in history for entry in group]
         while True:
             try:
-                response = ollama.chat(prompt, model, options={"temperature": 0.0, "num_ctx": 16384, "num_predict": 900}, tools=specs, think=False if model.startswith("qwen3") else None)
+                response = inference.chat(
+                    prompt, model, options={"temperature": 0.0, "num_ctx": 16384, "num_predict": 900},
+                    tools=specs, think=False,
+                    timeout=75, streaming=True, max_elapsed=150, stop=stop)
                 break
             except Exception as exc:
-                # An Ollama rejection can be specific to the model. Replay only
+                # An llama.cpp rejection can be specific to the model. Replay only
                 # this inference call. Tool execution and receipts stay outside it.
-                fallback = next(candidates, None) if isinstance(exc, ollama.OllamaError) else None
+                if stop and stop.is_set():
+                    return out
+                fallback = next(candidates, None) if not tried_fallback and isinstance(exc, inference.InferenceError) else None
                 if not fallback:
                     reason = f"planner unavailable: {exc}"
                     out["rationale"] = reason
                     out["flagged"].append({"name": "workflow", "reason": reason})
                     return out
-                if stop and stop.is_set():
-                    return out
+                tried_fallback = True
                 if emit:
                     emit("status", {"message": "planner_fallback", "model": fallback})
                 model = out["model"] = fallback
@@ -206,12 +258,19 @@ def plan(message: str, snapshot: dict[str, Any], recalled_context: str = "", ses
                 out["flagged"].append({"name": name, "reason": "hallucinated tool name; dropped"})
                 tool_results_for_model.append({"role": "tool", "content": json.dumps({"error": f"tool {name} does not exist"})})
                 continue
+            if verified_mail_flow and name == "notion_calendar_create":
+                tool_results_for_model.append({"role": "tool", "content": "PODA already handled email-derived calendar additions."})
+                continue
             try:
                 args = tools.validate_args(name, call["arguments"])
             except tools.ToolValidationError as exc:
                 out["flagged"].append({"name": name, "reason": str(exc)})
                 tool_results_for_model.append({"role": "tool", "content": json.dumps({"error": str(exc)})})
                 continue
+            if unattended and schedule_timezone and name == "notion_agenda":
+                args["timezone_name"] = schedule_timezone
+                if schedule_day and args.get("day", "").strip().lower() == "today":
+                    args["day"] = schedule_day
             if unattended and unattended_mail_accounts and name.startswith("mail_") and "account_id" in tools.TOOLS[name]["schema"]["properties"]:
                 if not args.get("account_id") and len(unattended_mail_accounts)==1:
                     args["account_id"] = unattended_mail_accounts[0]
@@ -219,6 +278,9 @@ def plan(message: str, snapshot: dict[str, Any], recalled_context: str = "", ses
                     out["flagged"].append({"name":name,"reason":"email account not selected for this automation"})
                     tool_results_for_model.append({"role":"tool","content":json.dumps({"error":"Choose one of the scheduled accounts"})})
                     continue
+            if reply_archive and name == "sandbox_write" and not args.get("expected_sha256"):
+                tool_results_for_model.append({"role": "tool", "content": "The reply writer will package these files into a ZIP."})
+                continue
             fingerprint=json.dumps({"name":name,"args":args},sort_keys=True,default=str)
             if fingerprint in seen_requests:
                 out["flagged"].append({"name":name,"reason":"identical tool call already attempted; avoided duplicate"})
@@ -252,7 +314,7 @@ def plan(message: str, snapshot: dict[str, Any], recalled_context: str = "", ses
         history.append([{"role": "assistant", "content": text[:1200],
                          "tool_calls": (reply.get("tool_calls") or [])[:len(tool_results_for_model)]},
                         *tool_results_for_model])
-        # Trim complete rounds so Ollama never sees orphaned tool messages.
+        # Trim complete rounds so llama.cpp never sees orphaned tool messages.
         while history and sum(len(json.dumps(group)) for group in history) > MAX_PLANNER_HISTORY_CHARS:
             history.pop(0)
         if pending_mutations or (unattended and tool_count >= MAX_UNATTENDED_TOOL_CALLS):

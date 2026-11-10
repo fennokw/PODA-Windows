@@ -65,6 +65,14 @@ jobs:
             }
           }
           Compress-Archive -Path $bundle -DestinationPath ../dist/PODA-Windows-x64.zip
+      - name: Verify managed Hindsight memory on Windows
+        shell: pwsh
+        env:
+          PODA_TEST_NATIVE_HINDSIGHT: '1'
+        run: |
+          $runtime = Get-ChildItem (Join-Path $env:RUNNER_TEMP 'poda-ci/desktop-runtime') -Directory | Select-Object -First 1
+          & (Join-Path $runtime.FullName 'Scripts/python.exe') -m pytest -q --basetemp (Join-Path $env:RUNNER_TEMP 'poda-hindsight-pytest') tests/test_managed_addons.py -k native_hindsight
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - uses: actions/upload-artifact@v6
         with:
           name: PODA-Windows-x64

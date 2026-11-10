@@ -5,7 +5,7 @@ import json
 from typing import Any, Callable
 
 from ..runtime.db import connect
-from . import fs_tools, exec_tools, grants, receipts, code_context
+from . import fs_tools, exec_tools, grants, receipts, code_context, sandbox_files
 
 
 def _memory_search(query: str, limit: int = 10) -> dict[str, Any]:
@@ -47,12 +47,13 @@ def _notion_query_items(start: str | None = None, end: str | None = None, limit:
         return {"ok": False, "result": None, "error": str(exc), "verification": "Notion request failed"}
 
 
-def _notion_agenda(day: str = "today", include_deadlines: bool = True) -> dict[str, Any]:
+def _notion_agenda(day: str = "today", include_deadlines: bool = True, timezone_name: str = "") -> dict[str, Any]:
     """Agenda for 'today' | 'tomorrow' | 'yesterday' | 'this week' | 'next week' | 'weekend' | YYYY-MM-DD, in local time."""
     try:
         from ..connectors.notion import mapping as notion_mapping  # type: ignore
-        start, end = notion_mapping.resolve_day_word(day)
-        data = notion_mapping.items_between_effective(start, end)
+        zone = {"tz_name": timezone_name} if timezone_name else {}
+        start, end = notion_mapping.resolve_day_word(day, **zone)
+        data = notion_mapping.items_between_effective(start, end, **zone)
     except Exception as exc:
         return {"ok": False, "result": None, "error": str(exc), "verification": "Notion request failed"}
     events = [i for i in data["items"] if not i.get("is_deadline")]
@@ -78,7 +79,7 @@ def _memory_dive(surface_id: str | None = None, query: str | None = None, limit:
 def _list_capabilities() -> dict[str, Any]:
     from ..runtime.capability import manifest
     cap = manifest()
-    return {"ok": True, "result": {k: cap[k] for k in ("filesystem", "code", "notion", "calendar", "email", "ollama", "offline_mode")}, "error": None, "verification": "live ledger probe"}
+    return {"ok": True, "result": {k: cap[k] for k in ("filesystem", "code", "notion", "calendar", "email", "inference", "offline_mode")}, "error": None, "verification": "live ledger probe"}
 
 
 def _str(desc: str, **kw: Any) -> dict[str, Any]:
@@ -98,6 +99,12 @@ def _schema(props: dict[str, Any], required: list[str]) -> dict[str, Any]:
 
 
 TOOLS: dict[str, dict[str, Any]] = {
+    "sandbox_list": {"description": "List files in PODA Sandbox, the app-owned workspace. No user folder grant is needed.", "mutating": False, "requires_confirmation": False, "needs": None,
+                     "handler": sandbox_files.sandbox_list, "schema": _schema({}, [])},
+    "sandbox_read": {"description": "Read a PODA Sandbox file by its filename. Returns text, editable document source, or base64, and the SHA-256 needed for an edit.", "mutating": False, "requires_confirmation": False, "needs": None,
+                     "handler": sandbox_files.sandbox_read, "schema": _schema({"path": _str("Sandbox filename only"), "offset": _int("Use next_offset from the previous read", 0, 24000000)}, ["path"])},
+    "sandbox_write": {"description": "Save a file in PODA Sandbox. Use Markdown for PDF or DOCX, CSV for XLSX, plain text for text files, or exact base64 bytes for any binary format. To edit, read first and pass its SHA-256. Use the complete updated content.", "mutating": True, "requires_confirmation": True, "needs": None,
+                      "handler": sandbox_files.sandbox_write, "schema": _schema({"path": _str("Sandbox filename only"), "content": _str("Complete file source or base64 bytes"), "encoding": _str("auto (default) or base64"), "expected_sha256": _str("Required to replace an existing file")}, ["path", "content"])},
     "code_context": {"description": "Cortex-style static source symbol/import map for a granted file. Use BEFORE editing to ground code changes. Does not execute the file.", "mutating": False, "requires_confirmation": False, "needs": "fs_read",
                 "handler": code_context.inspect_code, "schema": _schema({"path": _str("Exact path to a granted source code file")}, ["path"])},
     "fs_list": {"description": "List files and folders inside a granted folder (depth ≤ 2).", "mutating": False, "requires_confirmation": False, "needs": "fs_read",
@@ -125,7 +132,7 @@ TOOLS: dict[str, dict[str, Any]] = {
     "notion_query_items": {"description": "Read the connected Notion calendar/task database. Pass start and end as local YYYY-MM-DD to get events, classes, and deadlines in local time (Canvas due times are converted from UTC).", "mutating": False, "requires_confirmation": False, "needs": "notion_read",
                            "handler": _notion_query_items, "schema": _schema({"start": _str("Local date lower bound YYYY-MM-DD"), "end": _str("Local date upper bound YYYY-MM-DD"), "limit": _int("Max items", 1, 200)}, [])},
     "notion_agenda": {"description": "Agenda from the connected Notion calendar for a day word: today, tomorrow, yesterday, this week, next week, weekend, or YYYY-MM-DD. Returns events/classes with local times and deadlines separately. Use this for 'what do I have on…' questions.", "mutating": False, "requires_confirmation": False, "needs": "notion_read",
-                      "handler": _notion_agenda, "schema": _schema({"day": _str("today | tomorrow | yesterday | this week | next week | weekend | YYYY-MM-DD"), "include_deadlines": _bool("Include homework/test due items")}, ["day"])},
+                      "handler": _notion_agenda, "schema": _schema({"day": _str("today | tomorrow | yesterday | this week | next week | weekend | YYYY-MM-DD"), "include_deadlines": _bool("Include homework/test due items"), "timezone_name": _str("Optional IANA timezone for the agenda")}, ["day"])},
     "list_capabilities": {"description": "Return PODA's live verified capability state.", "mutating": False, "requires_confirmation": False, "needs": None,
                           "handler": _list_capabilities, "schema": _schema({}, [])},
 }
@@ -158,7 +165,8 @@ def _load_extensions() -> None:
         "mutating":True,"requires_confirmation":True,"needs":"notion_insert",
         "handler":create_calendar_event,
         "schema":_schema({"title":_str("Event title"),"start":_str("ISO 8601 datetime with timezone offset"),
-            "end":_str("Optional ISO 8601 end datetime with offset"),"notes":_str("Optional details")},["title","start"])}
+            "end":_str("Optional ISO 8601 end datetime with offset"),"notes":_str("Optional details"),
+            "commitment":_str("Existing Notion Commitment select option, such as Maybe")},["title","start"])}
     })
     register_extension({
         "notion_calendar_update":{"description":"Update title and/or date of a Notion calendar event by page ID; confirmation is required outside explicitly authorized automation.","mutating":True,"requires_confirmation":True,"needs":"notion_update",
@@ -262,7 +270,7 @@ def availability(snapshot: dict[str, Any] | None = None) -> dict[str, dict[str, 
     return out
 
 
-def ollama_tool_specs(snapshot: dict[str, Any] | None = None, only_available: bool = True) -> list[dict[str, Any]]:
+def model_tool_specs(snapshot: dict[str, Any] | None = None, only_available: bool = True) -> list[dict[str, Any]]:
     avail = availability(snapshot)
     specs = []
     for name, spec in TOOLS.items():
