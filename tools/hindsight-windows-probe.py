@@ -1,4 +1,5 @@
 import os
+import re
 import subprocess
 from pathlib import Path
 import pg0
@@ -20,19 +21,13 @@ def invoke(command, env, flags, timeout=20):
     except subprocess.TimeoutExpired:
         print("Timeout", flush=True)
 
-for label, keys_for_run, flags in (
-    ("poda", keys, subprocess.CREATE_NO_WINDOW),
-    ("full-env", tuple(os.environ), subprocess.CREATE_NO_WINDOW),
-    ("windows-vars", keys + win_keys, subprocess.CREATE_NO_WINDOW),
-    ("console", keys + win_keys, 0),
-):
-    print(label, flush=True)
-    root = base / label
-    env = {key: os.environ[key] for key in keys_for_run if key in os.environ}
-    env.update(PG0_HOME=str(root / "database"), PG0_INSTALLATION_DIR=str(root / "postgres"))
-    invoke([str(program), "start", "--name", "poda", "--username", "hindsight", "--password", "fixture", "--database", "hindsight"], env, flags)
-    for name in ("initdb.exe", "postgres.exe"):
-        for child in (root / "postgres").rglob(name):
-            print(child.relative_to(root), flush=True)
-            invoke([str(child), "--version"], env, flags)
-    invoke([str(program), "stop", "--name", "poda"], env, flags)
+tools = Path(os.environ["SystemRoot"]) / "System32"
+identity = subprocess.check_output([str(tools / "whoami.exe"), "/user", "/fo", "csv", "/nh"])
+sid = re.search(rb'"(S-1-[0-9-]+)"', identity)[1].decode("ascii")
+root = base / "explicit-user"
+env = {key: os.environ[key] for key in keys if key in os.environ}
+env.update(PG0_HOME=str(root / "database"), PG0_INSTALLATION_DIR=str(root / "postgres"))
+(root / "database").mkdir(parents=True)
+invoke([str(tools / "icacls.exe"), str(root / "database"), "/grant:r", f"*{sid}:(OI)(CI)F", "/T"], env, subprocess.CREATE_NO_WINDOW)
+invoke([str(program), "start", "--name", "poda", "--username", "hindsight", "--password", "fixture", "--database", "hindsight"], env, subprocess.CREATE_NO_WINDOW, 40)
+invoke([str(program), "stop", "--name", "poda"], env, subprocess.CREATE_NO_WINDOW)
