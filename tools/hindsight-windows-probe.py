@@ -1,6 +1,7 @@
 import os
 import re
 import subprocess
+import tempfile
 from pathlib import Path
 import pg0
 
@@ -15,11 +16,13 @@ win_keys = ("SYSTEMDRIVE", "PROGRAMDATA", "PROGRAMFILES", "PROGRAMFILES(X86)", "
             "HOMEDRIVE", "HOMEPATH", "USERNAME", "USERDOMAIN", "USERDOMAIN_ROAMINGPROFILE",
             "COMPUTERNAME", "OS", "PROCESSOR_ARCHITECTURE", "NUMBER_OF_PROCESSORS", "SESSIONNAME")
 def invoke(command, env, flags, timeout=20):
-    try:
-        result = subprocess.run(command, env=env, capture_output=True, timeout=timeout, creationflags=flags)
-        print(f"status={result.returncode:#x} stdout={result.stdout[-3000:]!r} stderr={result.stderr[-3000:]!r}", flush=True)
-    except subprocess.TimeoutExpired:
-        print("Timeout", flush=True)
+    with tempfile.TemporaryFile() as stdout, tempfile.TemporaryFile() as stderr:
+        status = subprocess.call(command, env=env, stdout=stdout, stderr=stderr, timeout=timeout, creationflags=flags)
+        stdout.seek(0)
+        stderr.seek(0)
+        print(f"status={status:#x} stdout={stdout.read()[-3000:]!r} stderr={stderr.read()[-3000:]!r}", flush=True)
+        if status:
+            raise SystemExit(status)
 
 tools = Path(os.environ["SystemRoot"]) / "System32"
 identity = subprocess.check_output([str(tools / "whoami.exe"), "/user", "/fo", "csv", "/nh"])
@@ -28,6 +31,6 @@ root = base / "explicit-user"
 env = {key: os.environ[key] for key in keys if key in os.environ}
 env.update(PG0_HOME=str(root / "database"), PG0_INSTALLATION_DIR=str(root / "postgres"))
 (root / "database").mkdir(parents=True)
-invoke([str(tools / "icacls.exe"), str(root / "database"), "/grant:r", f"*{sid}:(OI)(CI)F", "/T"], env, subprocess.CREATE_NO_WINDOW)
+invoke([str(tools / "icacls.exe"), str(root / "database"), "/grant:r", f"*{sid}:(OI)(CI)F"], env, subprocess.CREATE_NO_WINDOW)
 invoke([str(program), "start", "--name", "poda", "--username", "hindsight", "--password", "fixture", "--database", "hindsight"], env, subprocess.CREATE_NO_WINDOW, 40)
 invoke([str(program), "stop", "--name", "poda"], env, subprocess.CREATE_NO_WINDOW)
