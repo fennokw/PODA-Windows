@@ -19,3 +19,5 @@ Start Ollama and run `ollama pull llama3.2:3b` and `ollama pull nomic-embed-text
 A prebuilt unsigned x64 package is available in the [desktop workflow artifacts](https://github.com/fennokw/PODA-Windows/actions/workflows/desktop.yml). The separate browser edition is available in [PODA Web](https://github.com/fennokw/PODA-Web).
 
 For optional Python and pytest execution with Docker Desktop's Linux engine, build [the included image](tools/WindowsExecution.dockerfile) as `poda-python:3.12` and set `PODA_WINDOWS_DOCKER=1` before launching PODA.
+
+Daily Automation resolves email event dates against the original send time, then verifies authorized Notion additions. To use the same read-only scheduling tools from an MCP client, run `python -m poda_app.scheduling.mcp` over stdio from the source folder with the PODA Python environment.
