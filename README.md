@@ -21,3 +21,5 @@ A prebuilt unsigned x64 package is available in the [desktop workflow artifacts]
 For optional Python and pytest execution with Docker Desktop's Linux engine, build [the included image](tools/WindowsExecution.dockerfile) as `poda-python:3.12` and set `PODA_WINDOWS_DOCKER=1` before launching PODA.
 
 Daily Automation resolves email event dates against the original send time, then verifies authorized Notion additions. To use the same read-only scheduling tools from an MCP client, run `python -m poda_app.scheduling.mcp` over stdio from the source folder with the PODA Python environment.
+
+Use **Personalize → Memory search with Hindsight** to install and enable the local search engine. Setup uses an installed Ollama chat model and the PODA embedding model. Hindsight keeps a derived index in the app's data folder. **Add-ons** contains the downloadable program catalog and saved skills. Program tools require a separate trust opt-in and per-tool enable switch. **Developer mode** in the toolbar reveals technical diagnostics.
